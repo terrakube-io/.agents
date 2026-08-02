@@ -300,3 +300,21 @@ mise run build           # go build ./...
 mise run lint            # golangci-lint run ./...
 mise run check           # all of the above
 ```
+
+---
+
+## 7. CLI Documentation Guidelines (`docs/user-guide/terrakube-cli/`)
+
+When writing or updating documentation for `terrakube-cli`:
+
+1. **Directory Structure**:
+   - Store command references in `docs/user-guide/terrakube-cli/commands/<resource>/`.
+   - Create a `README.md` overview per resource directory and individual files for subcommands: `list.md`, `create.md`, `get.md`, `update.md`, `delete.md`.
+2. **Installation Methods**:
+   - Exclude package managers like Homebrew or Chocolatey. Document only official GitHub release binary downloads (Linux, macOS, Windows) and building from source via `go build main.go`.
+3. **Script Guidelines**:
+   - When writing example bash scripts creating resources (Organizations, Workspaces, Projects), generate and append a random 4-character alphanumeric suffix (`RAND_SUFFIX=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)`).
+4. **Navigation Table of Contents**:
+   - Always update `docs/SUMMARY.md` to register newly created documentation markdown files under the `Terrakube CLI` section.
+
+
