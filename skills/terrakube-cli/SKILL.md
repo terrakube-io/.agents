@@ -235,6 +235,34 @@ func FixtureMyResourceList() []*terrakube.MyResource {
 - **Use `executeCommand(args...)`** to run CLI commands — it captures stdout and returns (output, error).
 - Tests run in `package cmd` (same package) to access internal helpers.
 
+### 3.6 BATS End-to-End Test Suite Conventions (`tests/e2e_operations.bats`)
+
+All integration and end-to-end CLI workflows are executed via BATS in `terrakube-cli/tests/e2e_operations.bats`.
+
+#### Execution Command
+```bash
+cd terrakube-cli
+go build -o terrakube main.go
+bats tests/e2e_operations.bats
+```
+
+#### Key BATS Rules & Invariants
+1. **Final Teardown Invariant**: Team deletion (`TERRAKUBE_ADMIN`) MUST always be executed as the absolute final step (`@test "... Delete TERRAKUBE_ADMIN team"`). New test cases must be added BEFORE the final team deletion step.
+2. **Dedicated / Temporary Workspaces**: For sub-resource and access control testing (e.g., Workspace Access, Collections, Projects), create a dedicated temporary workspace within the test case (`terrakube workspace create`), perform the CRUD operations, validate output, and soft-delete the temporary workspace (`terrakube workspace update --deleted`) before ending the test step.
+3. **Output Format Assertions**: Every resource step MUST test both `--output json` (verifying attributes with `jq`) and `--output table` output formats.
+4. **Standard Resource Naming Patterns**:
+   - **Organization Variables & Collection Items**: `dummy+4alphanumeric` keys and values (`dummyXXXX`).
+   - **Agents**: `agent+4alphanumeric`, initial URL `https://localhost:8080`, updated `https://localhost:8181`.
+   - **Modules**: `iam+4alphanumeric`, source `https://github.com/terraform-google-modules/terraform-google-iam`.
+   - **Providers**: `random+4alphanumeric`, version `3.0.1`, implementation `linux/amd64`.
+   - **Templates**: `tmpl+4alphanumeric`, description `desc+4alphanumeric`, version `1.0.0`, with base64-encoded TCL YAML flow.
+   - **Federated Credentials**: `fed+4alphanumeric`, issuer URL `https://token.actions.githubusercontent.com`, audience `api://Terrakube`, claim key `repository_owner`.
+   - **Workspaces**: `test+4alphanumeric`, `wsacc+4alphanumeric`, `colws+4alphanumeric`, `prjws+4alphanumeric`.
+5. **`terrakube-go` Struct Synchronization**:
+   - Check the backend Java entity definition (`io.terrakube.api.rs...`).
+   - If the Java entity does NOT extend `GenericAuditFields`, remove `createdBy`, `createdDate`, `updatedBy`, `updatedDate` from the `terrakube-go` struct definition to avoid JSON:API 404 attribute errors on `POST`/`PATCH`.
+   - Add `omitempty` to computed attribute tags (e.g., `registryPath`, `latestVersion`).
+
 ---
 
 ## 4. Output Rendering
