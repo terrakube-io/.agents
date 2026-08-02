@@ -20,3 +20,7 @@
 * All new CLI resources MUST use the `resource.Register[T]()` framework pattern. Do NOT create hand-written Cobra subcommands.
 * The `terrakube-cli` must follow the following guidelines:
   - Guidelines: .agents/skills/terrakube-cli/SKILL.md
+
+## 5. Git Commands
+* All git commands must follow the following guidelines:
+  - Guidelines: rules/git-commands.md
