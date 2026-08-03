@@ -145,3 +145,31 @@ When introducing a new domain model or REST API capability to Terrakube:
 3. [ ] **Security Checks**: Define custom `OperationCheck<T>` classes in `io.terrakube.api.rs.checks.<domain>` annotated with `@SecurityCheck(RULE)`.
 4. [ ] **Entity Permission Binding**: Annotate the entity class and/or sensitive fields with `@ReadPermission`, `@CreatePermission`, `@UpdatePermission`, `@DeletePermission`.
 5. [ ] **Lifecycle Hooks**: If business side-effects (creating resources, notifying webhooks, validating data) are needed, create a `LifeCycleHook<T>` implementation in `io.terrakube.api.rs.hooks.<domain>` and bind it via `@LifeCycleHookBinding`.
+
+---
+
+## 6. Shared Repository Webhooks & Async Reconciliation Architecture
+
+When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and GitLab v2 webhooks):
+
+1. **Elide Lifecycle Hook Binding (`WebhookManageHook`)**:
+   - Synchronous operations (e.g. legacy per-workspace hook deletion) run in `PRECOMMIT`.
+   - Asynchronous reconciliation triggers must run in `POSTCOMMIT` via `RepoWebhookSyncScheduler`. `POSTCOMMIT` guarantees database transactions are committed before background Quartz jobs query workspace data.
+
+2. **Quartz Job Coalescing (`RepoWebhookSyncScheduler`)**:
+   - Deterministically key Quartz jobs using `SHA-256(normalizedRepositoryUrl)`.
+   - Catch `ObjectAlreadyExistsException` and `JobPersistenceException` to coalesce concurrent workspace webhook edits for the same repository URL into a single background job run.
+
+3. **Disallow Concurrent Execution (`RepoWebhookSyncJob`)**:
+   - Annotate `Job` implementations with `@DisallowConcurrentExecution`.
+   - Fetch all workspaces matching the normalized URL with `isMigratedV2 = true`.
+   - If workspaces remain: aggregate event types across all workspaces and create/update the single shared VCS webhook.
+   - If no workspaces remain: execute `cleanupIfOrphan()` to remove the VCS webhook and DB entity.
+
+4. **Testing Shared Webhook Logic (`RepoWebhookServiceTest`)**:
+   - Test DB race-condition recovery when `saveAndFlush` throws `DataIntegrityViolationException`.
+   - Validate multi-workspace event aggregation (`PUSH`, `PULL_REQUEST`, `RELEASE`).
+   - Validate fanout job generation filtering by branch pattern, file changes, and priority.
+
+For code examples and detailed architectural breakdown, see [shared-webhooks.md](file:///home/user/git/terrakube-io/.agents/skills/terrakube-elide-api/references/shared-webhooks.md).
+
