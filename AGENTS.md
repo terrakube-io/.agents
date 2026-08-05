@@ -21,6 +21,12 @@
 * The `terrakube-cli` must follow the following guidelines:
   - Guidelines: .agents/skills/terrakube-cli/SKILL.md
 
-## 5. Git Commands
+## 5. Terrakube Spring Boot Starter (`terrakube-spring-boot-starter`)
+* The `terrakube-spring-boot-starter` client library must be developed in `terrakube-spring-boot-starter/terrakube-client`.
+* Extending the client (adding models, endpoints, or tests) must follow the guidelines:
+  - Guidelines: .agents/skills/terrakube-spring-boot-starter/SKILL.md
+
+## 6. Git Commands
 * All git commands must follow the following guidelines:
   - Guidelines: rules/git-commands.md
+
