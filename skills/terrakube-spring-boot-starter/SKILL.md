@@ -200,3 +200,4 @@ void getWorkspaceById_returnsWorkspace() {
 - [ ] Add proper `@Headers` (e.g. `Content-Type: application/vnd.api+json` for Elide POST/PATCH).
 - [ ] Add WireMock test in `TerrakubeClientTest.java`.
 - [ ] Run `./mvnw clean test -f terrakube-spring-boot-starter/pom.xml` to verify build & test suite.
+

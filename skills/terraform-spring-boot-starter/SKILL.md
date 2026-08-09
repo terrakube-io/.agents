@@ -30,14 +30,22 @@ terraform-spring-boot/
 ## 2. Compilation & Build Guidelines
 
 ### 2.1 Maven Build Command
-To compile, run unit tests, and install `terraform-spring-boot` artifacts into local Maven repository without GPG signing:
+To compile, run unit tests, and install `terraform-spring-boot` artifacts into local Maven repository without GPG signing or Javadoc generation:
 ```bash
-mvn install -Dgpg.skip
+mvn install -Dgpg.skip -Dmaven.javadoc.skip=true
 ```
 
-### 2.2 JDK Requirement & Lombok Compatibility
-* **Java Version**: Always build using **JDK 21** (e.g. `21.0.9-librca`).
-* **Lombok Note**: Avoid early-access JDK 25 releases. JDK 25 internal `javac` AST changes cause Lombok annotation processing to fail during compilation (`cannot find symbol` errors for `@Getter`, `@Setter`, `@Slf4j`, and generated methods).
+### 2.2 JDK Requirement & SDKMAN Switching
+* **Java Version**: Always build `terraform-spring-boot` using **JDK 21** (e.g. `21.0.9-librca`).
+* **SDKMAN Switching**:
+  ```bash
+  # Switch JDK in current shell context:
+  sdk use java 21.0.9-librca
+  
+  # Or run Maven command inline with explicit JDK 21 environment:
+  JAVA_HOME=/home/user/.sdkman/candidates/java/21.0.9-librca PATH=/home/user/.sdkman/candidates/java/21.0.9-librca/bin:$PATH mvn install -DskipTests -Dgpg.skip -Dmaven.javadoc.skip=true
+  ```
+* **Lombok Compatibility Note**: Do NOT build `terraform-spring-boot` using JDK 25. JDK 25 internal `javac` AST changes cause Lombok annotation processing to fail during `terraform-spring-boot` compilation (`cannot find symbol` errors for `@Getter`, `@Setter`, `@Slf4j`, etc.).
 
 ### 2.3 Javadoc Comment Formatting
 * **Escape Angle Brackets**: Wrap version constraint operators (`<`, `>`) in Javadoc comments using `{@code ...}`.

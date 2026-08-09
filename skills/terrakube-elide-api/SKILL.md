@@ -173,3 +173,47 @@ When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and G
 
 For code examples and detailed architectural breakdown, see [shared-webhooks.md](file:///home/user/git/terrakube-io/.agents/skills/terrakube-elide-api/references/shared-webhooks.md).
 
+---
+
+## 7. Compilation & JDK Requirements
+
+Terrakube modules (`terrakube/executor`, `terrakube/api`, `terrakube/registry`) require **JDK 25** (`25.0.2-librca`), whereas `terraform-spring-boot` requires **JDK 21** (`21.0.9-librca`).
+
+### Switching JDK via SDKMAN for `terrakube` Compilation:
+```bash
+# Switch to JDK 25 in current shell context:
+sdk use java 25.0.2-librca
+
+# Or execute Maven command inline with explicit JDK 25 environment:
+JAVA_HOME=/home/user/.sdkman/candidates/java/25.0.2-librca PATH=/home/user/.sdkman/candidates/java/25.0.2-librca/bin:$PATH mvn compile -pl executor
+```
+
+---
+
+## 8. Terraform & OpenTofu Binary Caching Architecture
+
+Terrakube Executor caches Terraform and OpenTofu binaries in cloud storage to prevent fresh Kubernetes pods from re-downloading binaries from HashiCorp or GitHub endpoints.
+
+### 8.1 `TerraformState` Interface Methods
+* `saveTerraformBinary(String version, boolean tofu, File binaryFile)`: Uploads binary executable to storage. Default implementation returns `false`.
+* `downloadTerraformBinary(String version, boolean tofu, File targetFile)`: Downloads cached binary executable from storage and sets executable permissions (`setExecutable(true, true)`). Default implementation returns `false`.
+
+### 8.2 Storage Provider Implementations & Keys
+* **AWS S3** (`AwsTerraformStateImpl`): `tfbinary/{product}/{version}/{product}` in configured bucket.
+* **Azure Blob** (`AzureTerraformStateImpl`): Container `tfbinary`, blob path `{product}/{version}/{product}`.
+* **GCP Storage** (`GcpTerraformStateImpl`): `tfbinary/{product}/{version}/{product}` in configured GCS bucket.
+* **Local Storage** (`LocalTerraformStateImpl`): `/.terraform-spring-boot/local/binary/{product}/{version}/{product}` under user home directory.
+
+### 8.3 Executor Orchestration (`TerraformExecutorServiceImpl`)
+Before and after `terraformClient.init()`:
+1. **Pre-Init Check (`ensureBinaryCached`)**:
+   - Resolves constraint to concrete version via `TerraformDownloader.resolveTerraformVersion()` / `resolveTofuVersion()`.
+   - Computes expected local binary path via `TerraformDownloader.getTerraformBinaryPath()`.
+   - If binary exists locally on disk: skips network/storage checks.
+   - If missing locally: calls `terraformState.downloadTerraformBinary(...)` to restore from storage.
+2. **Post-Init Cache Backup (`saveBinaryToCache`)**:
+   - If binary was missing from storage and `init` completed successfully, uploads the newly downloaded binary to cloud storage via `terraformState.saveTerraformBinary(...)`.
+3. **Fail-Safe Design**:
+   - All caching operations are wrapped in `try-catch` blocks that log warnings on failure, ensuring job execution always falls back gracefully to standard downloading.
+
+
