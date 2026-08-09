@@ -60,6 +60,40 @@ switch (operation) {
 
 ---
 
+### A2. Child Event Lifecycle Hook (`WebhookEventManageHook.java`)
+Location: `io.terrakube.api.rs.hooks.webhook.WebhookEventManageHook`
+
+- Implements `com.yahoo.elide.core.lifecycle.LifeCycleHook<WebhookEvent>`.
+- Bound to `WebhookEvent` entity `CREATE`, `UPDATE`, and `DELETE` in `POSTCOMMIT` phase.
+- **Why separate event hooks are required**: API clients (e.g., `terraform-provider-terrakube` or REST API callers) frequently create, update, or delete child `WebhookEvent` rows without mutating the parent `Webhook` entity. Because shared webhooks aggregate event types (`PUSH`, `PULL_REQUEST`, `RELEASE`) across all events in all workspaces sharing the repository URL, `WebhookEvent` mutations must independently schedule a post-commit resync.
+
+```java
+@Slf4j
+public class WebhookEventManageHook implements LifeCycleHook<WebhookEvent> {
+    @Autowired
+    RepoWebhookSyncScheduler repoWebhookSyncScheduler;
+
+    @Override
+    public void execute(Operation operation, TransactionPhase phase, WebhookEvent webhookEvent,
+            RequestScope requestScope, Optional<ChangeSpec> changes) {
+        if (phase != TransactionPhase.POSTCOMMIT) return;
+        Webhook webhook = webhookEvent.getWebhook();
+        if (webhook == null || !webhook.isMigratedV2() || !isSharedWebhookProvider(webhook)) return;
+
+        try {
+            Workspace workspace = webhook.getWorkspace();
+            String normalizedUrl = RepoUrlNormalizer.normalize(workspace.getSource());
+            if (normalizedUrl == null) return;
+            repoWebhookSyncScheduler.scheduleSync(normalizedUrl, workspace.getId().toString());
+        } catch (Exception e) {
+            log.error("Failed to schedule repo webhook sync after {} webhook event", operation, e);
+        }
+    }
+}
+```
+
+---
+
 ### B. Quartz Coalescing Scheduler (`RepoWebhookSyncScheduler.java`)
 Location: `io.terrakube.api.plugin.scheduler.webhook.RepoWebhookSyncScheduler`
 
@@ -94,7 +128,7 @@ public void scheduleSync(String normalizedRepositoryUrl, String workspaceId) {
     } catch (ObjectAlreadyExistsException _) {
         // Coalesced: another job for this exact URL is already scheduled
     } catch (JobPersistenceException e) {
-        // Coalesced: lost a race on job store insert
+        // Coalesced: lost a race on Quartz JDBC job store insert
     }
 }
 ```
@@ -160,6 +194,34 @@ public RepoWebhook getOrCreateRepoWebhook(Workspace workspace) {
 
 ---
 
+### E. Lifecycle Hook Binding Reflection Tests (`WebhookLifeCycleHookBindingTest.java`)
+Location: `terrakube/api/src/test/java/io/terrakube/api/rs/webhook/WebhookLifeCycleHookBindingTest.java`
+Location: `terrakube/api/src/test/java/io/terrakube/api/rs/webhook/WebhookEventLifeCycleHookBindingTest.java`
+
+Standard unit tests invoke `hook.execute()` directly, which cannot detect missing or misconfigured `@LifeCycleHookBinding` annotations on entity classes. Reflection-based binding tests verify that annotations are explicitly declared:
+
+```java
+class WebhookEventLifeCycleHookBindingTest {
+    private record Binding(LifeCycleHookBinding.Operation operation, LifeCycleHookBinding.TransactionPhase phase) {}
+
+    @Test
+    void registersEventHookForPostCommitMutations() {
+        Set<Binding> registered = java.util.Arrays.stream(
+                WebhookEvent.class.getAnnotationsByType(LifeCycleHookBinding.class))
+                .filter(binding -> binding.hook() == WebhookEventManageHook.class)
+                .map(binding -> new Binding(binding.operation(), binding.phase()))
+                .collect(Collectors.toSet());
+
+        assertThat(registered).containsExactlyInAnyOrder(
+                new Binding(LifeCycleHookBinding.Operation.CREATE, LifeCycleHookBinding.TransactionPhase.POSTCOMMIT),
+                new Binding(LifeCycleHookBinding.Operation.UPDATE, LifeCycleHookBinding.TransactionPhase.POSTCOMMIT),
+                new Binding(LifeCycleHookBinding.Operation.DELETE, LifeCycleHookBinding.TransactionPhase.POSTCOMMIT));
+    }
+}
+```
+
+---
+
 ## 3. Unit Testing Guidelines (`RepoWebhookServiceTest.java`)
 Location: `terrakube/api/src/test/java/io/terrakube/api/plugin/vcs/RepoWebhookServiceTest.java`
 
@@ -168,3 +230,4 @@ When writing test cases for shared VCS webhooks:
 2. **CreateOrUpdateSharedWebhook**: Verify aggregation of `WebhookEventType` sets (`PUSH`, `PULL_REQUEST`, `RELEASE`) across multiple workspaces sharing the repo URL.
 3. **CleanupIfOrphan**: Test deletion of both VCS remote webhook and `RepoWebhook` DB entity when 0 migrated workspaces remain.
 4. **ProcessV2Webhook**: Test HMAC signature verification failure (`SecurityException`), ping events, PR file change matching, release tag regex matching, and job fanout to multiple matching workspaces.
+5. **Annotation Binding Tests**: Include reflection tests (`WebhookLifeCycleHookBindingTest` and `WebhookEventLifeCycleHookBindingTest`) for all Elide lifecycle hook bindings to catch omitted `@LifeCycleHookBinding` annotations before runtime.

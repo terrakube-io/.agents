@@ -152,13 +152,14 @@ When introducing a new domain model or REST API capability to Terrakube:
 
 When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and GitLab v2 webhooks):
 
-1. **Elide Lifecycle Hook Binding (`WebhookManageHook`)**:
+1. **Elide Lifecycle Hook Binding (`WebhookManageHook` & `WebhookEventManageHook`)**:
    - Synchronous operations (e.g. legacy per-workspace hook deletion) run in `PRECOMMIT`.
    - Asynchronous reconciliation triggers must run in `POSTCOMMIT` via `RepoWebhookSyncScheduler`. `POSTCOMMIT` guarantees database transactions are committed before background Quartz jobs query workspace data.
+   - Separate lifecycle hooks MUST be bound to both `Webhook` (`WebhookManageHook`) AND child `WebhookEvent` entities (`WebhookEventManageHook`). Event-only mutations (e.g. toggling event types via Terraform provider or REST clients) must independently trigger post-commit reconciliation.
 
 2. **Quartz Job Coalescing (`RepoWebhookSyncScheduler`)**:
    - Deterministically key Quartz jobs using `SHA-256(normalizedRepositoryUrl)`.
-   - Catch `ObjectAlreadyExistsException` and `JobPersistenceException` to coalesce concurrent workspace webhook edits for the same repository URL into a single background job run.
+   - Catch both `ObjectAlreadyExistsException` and `JobPersistenceException` (unique constraint violations on the Quartz JDBC job store) to coalesce concurrent workspace/event edits into a single background job run.
 
 3. **Disallow Concurrent Execution (`RepoWebhookSyncJob`)**:
    - Annotate `Job` implementations with `@DisallowConcurrentExecution`.
@@ -170,6 +171,7 @@ When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and G
    - Test DB race-condition recovery when `saveAndFlush` throws `DataIntegrityViolationException`.
    - Validate multi-workspace event aggregation (`PUSH`, `PULL_REQUEST`, `RELEASE`).
    - Validate fanout job generation filtering by branch pattern, file changes, and priority.
+   - **Reflection-based binding tests**: Add `WebhookLifeCycleHookBindingTest` and `WebhookEventLifeCycleHookBindingTest` using `getAnnotationsByType(LifeCycleHookBinding.class)` to verify `@LifeCycleHookBinding` registrations directly, as standard unit tests invoking `execute()` bypass Elide annotation bindings.
 
 For code examples and detailed architectural breakdown, see [shared-webhooks.md](file:///home/user/git/terrakube-io/.agents/skills/terrakube-elide-api/references/shared-webhooks.md).
 
