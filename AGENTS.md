@@ -30,3 +30,8 @@
 * All git commands must follow the following guidelines:
   - Guidelines: rules/git-commands.md
 
+## 7. Ephemeral Executor (`io.terrakube.api.plugin.scheduler.job.tcl.executor.ephemeral`)
+* The Ephemeral Executor builds Kubernetes `batch/v1` Jobs via Fabric8 Kubernetes client and Server-Side Apply.
+* Extending or modifying ephemeral executor capabilities must follow the guidelines:
+  - Guidelines: .agents/skills/terrakube-ephemeral-executor/SKILL.md
+
