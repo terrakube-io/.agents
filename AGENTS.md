@@ -35,3 +35,8 @@
 * Extending or modifying ephemeral executor capabilities must follow the guidelines:
   - Guidelines: .agents/skills/terrakube-ephemeral-executor/SKILL.md
 
+## 8. Structured Output (Plan & Apply)
+* Structured output generation, real-time JSON streaming, post-hoc state resolution, and sensitivity sanitization for Plan and Apply operations are managed in `io.terrakube.executor.service.terraform`.
+* Guidelines: .agents/skills/terrakube-structured-output/SKILL.md
+
+
