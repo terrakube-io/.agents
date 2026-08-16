@@ -39,4 +39,7 @@
 * Structured output generation, real-time JSON streaming, post-hoc state resolution, and sensitivity sanitization for Plan and Apply operations are managed in `io.terrakube.executor.service.terraform`.
 * Guidelines: .agents/skills/terrakube-structured-output/SKILL.md
 
-
+## 9. Registry Performance Benchmarking (`terrakube/benchmarks/registry`)
+* Performance benchmarks and A/B container image evaluations for `terrakube-registry` are automated in `terrakube/benchmarks/registry`.
+* All benchmark executions must adhere to the concurrency staging (`5, 10, 25` workers), fixture provisioning, and OpenTelemetry / Prometheus PromQL metric conventions.
+* Guidelines: .agents/skills/terrakube-registry-performance/SKILL.md
