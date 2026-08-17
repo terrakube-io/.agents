@@ -43,3 +43,8 @@
 * Performance benchmarks and A/B container image evaluations for `terrakube-registry` are automated in `terrakube/benchmarks/registry`.
 * All benchmark executions must adhere to the concurrency staging (`5, 10, 25` workers), fixture provisioning, and OpenTelemetry / Prometheus PromQL metric conventions.
 * Guidelines: .agents/skills/terrakube-registry-performance/SKILL.md
+
+## 10. Modular Storage Architecture & Container Image Splitting (`terrakube/storage`)
+* Cloud storage implementations (AWS S3, Azure Blob, GCP Cloud Storage, Local) are maintained as independent Spring Boot 3 starters under `terrakube/storage`.
+* Consuming components (`registry`, `api`, `executor`) must use Maven profiles (`-Paws`, `-Pazure`, `-Pgcp`, default `-Pall`) and Spring Boot 3 `@AutoConfiguration` to support split container images.
+* Guidelines: .agents/skills/terrakube-modular-storage/SKILL.md
