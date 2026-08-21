@@ -48,3 +48,9 @@
 * Cloud storage implementations (AWS S3, Azure Blob, GCP Cloud Storage, Local) are maintained as independent Spring Boot 3 starters under `terrakube/storage`.
 * Consuming components (`registry`, `api`, `executor`) must use Maven profiles (`-Paws`, `-Pazure`, `-Pgcp`, default `-Pall`) and Spring Boot 3 `@AutoConfiguration` to support split container images.
 * Guidelines: .agents/skills/terrakube-modular-storage/SKILL.md
+
+## 11. External HTTP Client & WebClient Conventions
+* Singleton services that inject `WebClient.Builder` MUST call `.clone()` before applying per-request mutations (`.defaultHeader(...)`, `.defaultHeaders(...)`, `.filter(...)`, `.baseUrl(...)`, `.clientConnector(...)`).
+* Static clients must be built once in the constructor and stored as immutable `private final WebClient webClient`.
+* Guidelines: rules/http-client-conventions.md
+
