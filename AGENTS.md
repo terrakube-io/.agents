@@ -54,3 +54,10 @@
 * Static clients must be built once in the constructor and stored as immutable `private final WebClient webClient`.
 * Guidelines: rules/http-client-conventions.md
 
+## 12. Job Processing, FIFO Queue & Distributed Locking (`io.terrakube.api.plugin.scheduler`)
+* Job dispatching, two-tier queueing (per-workspace serialization and cluster-level FIFO), and distributed locking are orchestrated in `io.terrakube.api.plugin.scheduler`.
+* Any new scheduler trigger or lifecycle hook MUST respect the Redis execution lock (`job-execution-lock:<jobId>` with 90s TTL) and fail closed if Redis is unreachable.
+* FIFO admission queries MUST use the guarded executable variants (`isJobNextInDispatchOrderExecutable` / `findNextDispatchableExecutableJobId`) to prevent head-of-line blocking from jobs with no remaining executable steps.
+* The execution lock MUST be released immediately upon receiving HTTP 202 Accepted from the executor and MUST NOT be held during the long-running execution of Terraform.
+* Guidelines: .agents/skills/terrakube-job-scheduler/SKILL.md
+
