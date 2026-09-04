@@ -218,4 +218,200 @@ Before and after `terraformClient.init()`:
 3. **Fail-Safe Design**:
    - All caching operations are wrapped in `try-catch` blocks that log warnings on failure, ensuring job execution always falls back gracefully to standard downloading.
 
+---
+
+## 9. Yahoo Elide GraphQL Queries, Pagination & Filtering Guide
+
+Terrakube exposes its primary GraphQL API through Yahoo Elide at `/graphql/api/v1`. Elide adheres to the **GraphQL Relay Connection Specification**, supporting connections (`edges`, `node`, `cursor`, `pageInfo`), built-in security checks, and datastore-level query optimization.
+
+### 9.1 Endpoint & Query Structure
+
+* **Endpoint:** `POST /graphql/api/v1`
+* **Headers:**
+  * `Authorization: Bearer <token>`
+  * `Content-Type: application/json`
+* **Envelope:** Standard GraphQL POST payload: `{"query": "...", "variables": { ... }}`
+
+#### Canonical Organization Workspaces Query:
+```graphql
+query GetWorkspacesPage(
+  $orgId: String!
+  $first: Int!
+  $after: String
+  $sort: String
+  $filter: String
+) {
+  organization(ids: [$orgId]) {
+    edges {
+      node {
+        id
+        name
+        workspace(first: $first, after: $after, sort: $sort, filter: $filter) {
+          edges {
+            cursor
+            node {
+              id
+              name
+              description
+              source
+              branch
+              terraformVersion
+              iacType
+              lastJobStatus
+              lastJobDate
+              locked
+              workspaceTag {
+                edges {
+                  node {
+                    tagId
+                  }
+                }
+              }
+              project {
+                edges {
+                  node {
+                    id
+                    name
+                  }
+                }
+              }
+            }
+          }
+          pageInfo {
+            startCursor
+            endCursor
+            hasNextPage
+            hasPreviousPage
+            totalRecords
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### 9.2 Pagination Architecture in Elide
+
+Elide supports two pagination modes on relationship and root collections:
+
+#### Mode 1: Offset Pagination (Default — Recommended for Ant Design UI)
+* **Arguments:**
+  * `first: Int`: Number of records to return (page size, e.g. `20`).
+  * `after: String`: The offset index to skip (e.g. `"0"` for page 1, `"20"` for page 2, `"40"` for page 3).
+* **`pageInfo` Structure:**
+  * `startCursor`: First record offset in the current page.
+  * `endCursor`: Last record offset in the current page.
+  * `hasNextPage`: Boolean indicating if subsequent records exist.
+  * `hasPreviousPage`: Boolean indicating if preceding records exist.
+  * `totalRecords`: Total matching record count across all pages (backed by `SELECT COUNT(...)`).
+* **Ant Design `<Pagination />` Integration:**
+  Offset pagination maps directly to page numbers:
+  ```ts
+  const offset = (page - 1) * pageSize;
+  const variables = {
+    first: pageSize,
+    after: String(offset),
+  };
+  ```
+  Users can jump to **any** page (`1`, `2`, `5`, `10`) without requiring sequential forward-cursor traversal.
+
+#### Mode 2: Keyset / Cursor Pagination
+* **Enabling on Entity:** Keyset cursor pagination is opt-in via the `@Paginate` annotation:
+  ```java
+  @Paginate(modes = { PaginationMode.OFFSET, PaginationMode.CURSOR })
+  @Entity(name = "workspace")
+  public class Workspace extends GenericAuditFields { ... }
+  ```
+* **How It Works:**
+  * Elide generates keyset SQL (`WHERE (sortField, id) > (:cursorValue, :cursorId)`).
+  * `after`: Receives the opaque string returned from the previous request's `pageInfo.endCursor`.
+  * Best for infinite scroll or large data exports where `OFFSET` performance degrades.
+
+---
+
+### 9.3 RSQL Filtering Syntax (`filter` Argument)
+
+Elide filters collections using **RSQL** (REST Query Language, a superset of FIQL). RSQL operators:
+* `==`: Exact equal (case-sensitive)
+* `=ini=`: Case-insensitive wildcard match (`*pattern*`)
+* `=in=`: In list (`=in=('a','b')`)
+* `=out=`: Not in list
+* `=isnull=true` / `=isnull=false`: Null checks
+* `;`: Logical AND (conjunction)
+* `,`: Logical OR (disjunction)
+
+#### Practical Terrakube Filter Examples:
+
+| Use Case | Elide RSQL Syntax |
+| :--- | :--- |
+| **Status Filter** | `lastJobStatus=='running'` |
+| **Never Executed** | `lastJobStatus=='NeverExecuted'` |
+| **Project ID** | `project.id=='d9b58bd3-f3fc-4056-a026-1163297e80a8'` |
+| **Unassigned Project** | `project=isnull=true` |
+| **Tag IDs (Any match)** | `workspaceTag.tagId=in=('tag-1','tag-2')` |
+| **Search (Name or Description)** | `(name=ini=*prod*,description=ini=*prod*)` |
+| **Combined Conjunction** | `lastJobStatus=='running';project.id=='...';(name=ini=*prod*,description=ini=*prod*)` |
+
+---
+
+### 9.4 Sorting Syntax (`sort` Argument)
+
+* **Syntax:** Comma-separated list of field names.
+* Prepend `+` for ascending (default if omitted).
+* Prepend `-` for descending.
+* Traversal across to-one relationships uses dot notation (`project.name`).
+
+#### Examples:
+* Sort by Name (Ascending): `sort: "+name"`
+* Sort by Name (Descending): `sort: "-name"`
+* Sort by Last Run Date (Descending): `sort: "-lastJobDate"`
+* Sort by Status: `sort: "+lastJobStatus"`
+* Compound Sort: `sort: "-lastJobDate,+name"`
+
+---
+
+### 9.5 Status Counts via GraphQL Field Aliasing
+
+To populate status badges (e.g., `All (42)`, `Running (2)`, `Completed (5)`) in a single network request without writing custom SQL aggregations, use **GraphQL Field Aliasing** requesting only `pageInfo { totalRecords }`:
+
+```graphql
+query GetWorkspaceStatusCounts($orgId: String!) {
+  organization(ids: [$orgId]) {
+    edges {
+      node {
+        all: workspace { pageInfo { totalRecords } }
+        running: workspace(filter: "lastJobStatus=='running'") { pageInfo { totalRecords } }
+        completed: workspace(filter: "lastJobStatus=='completed'") { pageInfo { totalRecords } }
+        failed: workspace(filter: "lastJobStatus=='failed'") { pageInfo { totalRecords } }
+        waitingApproval: workspace(filter: "lastJobStatus=='waitingApproval'") { pageInfo { totalRecords } }
+        neverExecuted: workspace(filter: "lastJobStatus=='NeverExecuted'") { pageInfo { totalRecords } }
+      }
+    }
+  }
+}
+```
+
+This returns:
+```json
+{
+  "data": {
+    "organization": {
+      "edges": [{
+        "node": {
+          "all": { "pageInfo": { "totalRecords": 42 } },
+          "running": { "pageInfo": { "totalRecords": 2 } },
+          "completed": { "pageInfo": { "totalRecords": 35 } },
+          "failed": { "pageInfo": { "totalRecords": 3 } },
+          "waitingApproval": { "pageInfo": { "totalRecords": 1 } },
+          "neverExecuted": { "pageInfo": { "totalRecords": 1 } }
+        }
+      }]
+    }
+  }
+}
+```
+
 
