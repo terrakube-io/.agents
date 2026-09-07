@@ -26,11 +26,10 @@ When adding a new resource or modifying an existing entity:
    - `@SQLRestriction`: (If applicable) Soft-delete filter (e.g. `@SQLRestriction("deleted = false")`).
 
 2. **Primary Key Mapping**:
-   - Always use `UUID` with `@Convert(converter = IdConverter.class)` and `@JdbcTypeCode(Types.VARCHAR)`:
+   - Always use `UUID` with `@JdbcTypeCode(Types.VARCHAR)` and `@GeneratedValue(strategy = GenerationType.UUID)`:
    ```java
    @Id
    @JdbcTypeCode(Types.VARCHAR)
-   @Convert(converter = IdConverter.class)
    @GeneratedValue(strategy = GenerationType.UUID)
    private UUID id;
    ```

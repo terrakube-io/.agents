@@ -3,7 +3,7 @@
 ## 1. Elide API Entity Conventions (`io.terrakube.api.rs`)
 * All JSON:API resources must be defined under `io.terrakube.api.rs` (or domain sub-packages).
 * Every entity MUST have `@Include`, `@Entity(name = "...")`, Lombok `@Getter`/`@Setter`, and explicit Elide security permission annotations (`@ReadPermission`, `@CreatePermission`, `@UpdatePermission`, `@DeletePermission`).
-* Primary key fields (`id`) MUST be typed `UUID` using `@JdbcTypeCode(Types.VARCHAR)` and `@Convert(converter = IdConverter.class)`.
+* Primary key fields (`id`) MUST be typed `UUID` using `@JdbcTypeCode(Types.VARCHAR)` and `@GeneratedValue(strategy = GenerationType.UUID)` (Note: `@Convert(converter = IdConverter.class)` is no longer necessary with Elide 7.2+).
 * All entity read, list, filter, sorting, and pagination queries MUST go through Elide's native GraphQL endpoint (`/graphql/api/v1`) or JSON:API endpoint (`/api/v1`).
 * NEVER create custom Spring GraphQL controllers (`@Controller`, `@QueryMapping`) or manual JPA Criteria queries for entity CRUD, listing, or pagination. Spring GraphQL (`/graphql`, `/subscriptions`) is strictly reserved for WebSocket subscriptions.
 
