@@ -70,6 +70,16 @@ public class UserBelongsOrganization extends OperationCheck<Organization> {
 }
 ```
 
+> [!CAUTION]
+> **No Underscores in Elide Security Check Expressions**:
+> Elide's expression tokenizer does not recognize underscore (`_`) characters in permission strings.
+> Always use space-separated alphanumeric words (e.g., `@SecurityCheck(TeamViewPolicySet.RULE)` where `RULE = "team view policy set"`, and `@ReadPermission(expression = "team view policy set")`).
+> Using `team_view_policy_set` causes `token recognition error at: '_'` during Elide application startup.
+
+> [!NOTE]
+> **Collection Routing & Entity Naming**:
+> When an entity specifies `@Entity(name = "snake_case_name")`, Yahoo Elide registers the root REST collection endpoint as `/api/v1/snake_case_name`. External clients, HTTP services, and Terraform provider resources must use snake_case URLs (e.g. `/api/v1/policy_set`), not camelCase.
+
 ---
 
 ## 3. Implementing Lifecycle Hooks (`LifeCycleHook`)
