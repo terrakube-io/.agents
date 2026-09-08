@@ -70,3 +70,13 @@
 * Resolution services running within background jobs (Quartz `ScheduleJob`) MUST NOT access lazy collections on detached entities; all tag, variable, and attachment queries must use dedicated repository methods (`workspaceTagRepository.findByWorkspace(...)`).
 * Guidelines: .agents/skills/terrakube-opa-policy-governance/SKILL.md
 
+## 14. Notification System & Webhook Outbox Architecture (`io.terrakube.api.plugin.notification`)
+* All outbound notifications (Slack, Microsoft Teams, Webhooks) MUST use the Transactional Outbox pattern (`notification_outbox`).
+* Network HTTP delivery calls MUST execute outside of database transactions to prevent connection pool exhaustion.
+* Database fields storing payloads or errors (`payload`, `last_error`) MUST use plain `@Column` mapped to PostgreSQL `text`, NEVER `@Lob`.
+* Entity relationships traversed via Elide GraphQL (such as `NotificationConfiguration.workspace`) MUST use `FetchType.EAGER` to prevent serialization of literal `"null"` proxy IDs.
+* Destructive/mutating outbox operations invoked from Quartz jobs MUST be delegated to a dedicated Spring `@Service` bean (`NotificationOutboxTransactions`) because Quartz `Job` instances are not wrapped in Spring AOP transactional proxies.
+* Destination URLs MUST be validated using `DestinationUrlValidator` to prevent SSRF attacks against internal network ranges.
+* Signing secrets MUST remain write-only using `@ReadPermission(expression = "read notification signing secret")`.
+* Guidelines: .agents/skills/terrakube-notifications/SKILL.md
+
