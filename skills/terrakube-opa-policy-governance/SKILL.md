@@ -141,6 +141,62 @@ OPA evaluations run in-runner inside the executor (both Kubernetes ephemeral con
 | **`soft_mandatory`** | Rule failure detected | Execution pauses. Job transitions to `waitingApproval` with `approvalTeam = overrideTeam`. Authorized SecOps users can approve with a mandatory justification. |
 | **`hard_mandatory`** | Rule failure detected | Execution is strictly blocked. Job transitions to `failed`, logs ANSI red errors, exits code 1, and prevents Terraform Apply. |
 
+### Soft-Mandatory Approval & Suspension Lifecycle
+
+When a Terraform plan produces soft-mandatory violations without hard-mandatory violations, Terrakube suspends the workflow before `terraformApply`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Runner as Executor (TerraformExecutorServiceImpl)
+    participant OPA as OpaExecutorServiceImpl
+    participant Context as JobContextService
+    participant Status as UpdateJobStatusImpl
+    participant API as Terrakube API (Job Entity)
+    participant Quartz as Quartz Scheduler (ScheduleJob)
+    participant UI as Terrakube UI (Jobs/Details)
+
+    Runner->>OPA: evaluateAllPolicies(job, plan.json)
+    OPA-->>Runner: List<OpaEvaluationResult> (soft > 0, hard == 0)
+    OPA->>Context: saveContext("policyEvaluation", payload with aggregate counts)
+    Runner->>Runner: Resolve overrideTeam from matching PolicyContext
+    Runner->>Status: setCompletedStatus(..., hasSoftMandatoryViolations=true, approvalTeam=overrideTeam)
+    Status->>API: updateJob(status="waitingApproval", approvalTeam=overrideTeam)
+    Status-->>Quartz: Job status is "waitingApproval"
+    Note over Quartz: Quartz ScheduleJob halts dispatch;<br/>terraformApply is NOT scheduled.
+    UI->>Context: Fetch /context/v1/{jobId}
+    Note over UI: UI displays "Action Required" tag and<br/>"Someone from {approvalTeam} must confirm"
+    UI->>API: Override or Approve Job (status="approved")
+    Quartz->>API: executeApprovedJobs() dispatches terraformApply
+```
+
+#### 1. In-Runner Evaluation & Team Resolution (`TerraformExecutorServiceImpl`)
+* After `opaExecutorService.evaluateAllPolicies(...)`:
+  - `hasHardViolations`: If any result has `hardMandatoryViolations > 0`, the run fails immediately (`executionPlan = false`, `exitCode = 1`).
+  - `hasSoftViolations`: If `softMandatoryViolations > 0` and no hard violations exist, the plan remains valid (`executionPlan = true`), but requires approval.
+  - The executor searches `terraformJob.getPolicyList()` for the violated policy set ID to extract its configured `overrideTeam`.
+  - Propagates `result.setHasSoftMandatoryViolations(true)` and `result.setApprovalTeam(overrideTeam)`.
+
+#### 2. Structured Context Aggregation (`OpaExecutorServiceImpl`)
+* In `saveStructuredContext`, the executor aggregates rule counts across all evaluated policy sets:
+  - `softMandatoryViolations`, `hardMandatoryViolations`, `passedRules`, `warningRules`, `shadowHardViolations`, `shadowSoftViolations`.
+  - Overall status: `FAILED` (if hard > 0), `WAITING_APPROVAL` (if soft > 0), `WARNING` (if warnings > 0), or `PASSED`.
+* Persisted to Redis/MinIO via `JobContextService` under the key `policyEvaluation`.
+* The UI (`Details.tsx`) inspects `policyEvaluation.softMandatoryViolations > 0` to render the yellow `"Action Required"` badge and present the approval banner.
+
+#### 3. Job Status Suspension (`UpdateJobStatusImpl`)
+* When `isPlan` is true and `hasSoftMandatoryViolations` is set on a successful plan (`exitCode != 1`):
+  - Sets `job.status = "waitingApproval"`.
+  - Sets `job.approvalTeam = approvalTeam` (e.g., `"SecOps"`).
+* Quartz's `ScheduleJob.doRunExecution` checks the job status. Because the status is `"waitingApproval"` rather than `"pending"`, the job falls into the default handler and the next step (`terraformApply`) is **not** scheduled.
+
+#### 4. Approval & Resumption
+* **Approval Actions**:
+  - Authorized team members can submit a policy override via the UI drawer (`POST /api/v2/runs/{jobId}/policy-checks/actions/override`) with a mandatory justification.
+  - Organization admins or members of `approvalTeam` approve the job (setting `status = "approved"`).
+* **Resumption**:
+  - Quartz detects `job.status == "approved"` and invokes `executeApprovedJobs(job)`, which transitions the job back to `pending` and dispatches `terraformApply`.
+
 ### VCS Feedback & PR Comments
 `PrCommentService` posts rich Markdown summaries to GitHub/GitLab pull requests:
 * Visual status header (Passed / Warning / Failed).
