@@ -80,3 +80,9 @@
 * Signing secrets MUST remain write-only using `@ReadPermission(expression = "read notification signing secret")`.
 * Guidelines: .agents/skills/terrakube-notifications/SKILL.md
 
+## 15. Local Devcontainer & Database Debugging (`terrakube-api.platform.local`)
+* The local development environment uses Docker Compose (`terrakube/.devcontainer`).
+* PostgreSQL is accessible at `postgresql-service:5432` inside Docker networks and `localhost:5432` on the host (`terrakube` / `terrakubepassword` / `terrakubedb`).
+* Direct query access via `docker exec -it postgresql-service psql -U terrakube -d terrakubedb` or host `psql -h localhost -p 5432 -U terrakube -d terrakubedb`.
+* Guidelines: .agents/skills/terrakube-devcontainer/SKILL.md
+
