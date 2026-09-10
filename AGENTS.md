@@ -86,3 +86,12 @@
 * Direct query access via `docker exec -it postgresql-service psql -U terrakube -d terrakubedb` or host `psql -h localhost -p 5432 -U terrakube -d terrakubedb`.
 * Guidelines: .agents/skills/terrakube-devcontainer/SKILL.md
 
+## 16. RBAC & Team Permission Architecture (`io.terrakube.api.rs.team`, `ProjectAccess`, `Access`)
+* Terrakube implements a 3-tier RBAC model (`Team` at Organization level, `ProjectAccess` at Project level, and `Access` at Workspace level) evaluated via `RbacV2Service`.
+* Predefined roles (`admin`, `write`, `plan`, `read`) supersede fine-grained boolean flags. The `custom` role (or null) falls back to evaluating individual boolean flags.
+* Whenever creating or seeding `Team` records in Liquibase or tests, ALL 12 permission attributes MUST be populated:
+  - `role`: `"admin"`, `"write"`, `"plan"`, `"read"`, or `"custom"`
+  - `manage_state`, `manage_collection`, `manage_job`, `manage_workspace`, `manage_module`, `manage_provider`, `manage_vcs`, `manage_template`, `manage_policies`, `plan_job`, `approve_job`
+* Administrative teams (e.g. `TERRAKUBE_ADMIN`) MUST have `role="admin"` and all boolean flags set to `true`.
+* Guidelines: .agents/skills/terrakube-rbac-permissions/SKILL.md
+
