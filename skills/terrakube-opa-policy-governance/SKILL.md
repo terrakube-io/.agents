@@ -56,6 +56,119 @@ flowchart TD
 
 All policy entities are Yahoo Elide JSON:API resources mapped under `io.terrakube.api.rs.policy`:
 
+```mermaid
+erDiagram
+    ORGANIZATION ||--o{ POLICY_SET : "defines (1:N)"
+    ORGANIZATION ||--o{ POLICY_EXEMPTION : "manages (1:N)"
+    ORGANIZATION ||--o{ WORKSPACE : "owns (1:N)"
+    ORGANIZATION ||--o{ PROJECT : "contains (1:N)"
+    ORGANIZATION ||--o{ TEAM : "has (1:N)"
+
+    VCS ||--o{ POLICY_SET : "hosts source (0..1:N)"
+    NOTIFICATION_CONFIGURATION ||--o{ POLICY_SET : "alerts (0..1:N)"
+
+    POLICY_SET ||--o{ POLICY_ATTACHMENT : "scopes via (1:N)"
+    POLICY_SET ||--o{ POLICY_EXEMPTION : "waives rules in (1:N)"
+
+    POLICY_ATTACHMENT }o--o| WORKSPACE : "targets workspace (0..1:1)"
+    POLICY_ATTACHMENT }o--o| PROJECT : "targets project (0..1:1)"
+    POLICY_ATTACHMENT }o--o| TAG : "targets tag (0..1:1)"
+
+    POLICY_EXEMPTION }o--o| WORKSPACE : "exempts workspace (0..1:1)"
+    POLICY_EXEMPTION }o--o| PROJECT : "exempts project (0..1:1)"
+
+    WORKSPACE ||--o{ JOB : "executes (1:N)"
+    JOB ||--o{ STEP : "executes (1:N)"
+    JOB ||--o{ POLICY_EVALUATION : "records (1:N)"
+    STEP ||--o{ POLICY_EVALUATION : "produces (1:N)"
+
+    POLICY_EVALUATION ||--o| POLICY_OVERRIDE : "overridden by (1:0..1)"
+
+    POLICY_SET {
+        uuid id PK "VARCHAR(36)"
+        varchar name "VARCHAR(255) NOT NULL"
+        text description "TEXT"
+        varchar enforcement_level "VARCHAR(50) NOT NULL [HARD_MANDATORY, SOFT_MANDATORY, ADVISORY]"
+        varchar shadow_enforcement_level "VARCHAR(50)"
+        varchar override_team "VARCHAR(255)"
+        boolean global "BOOLEAN NOT NULL DEFAULT false"
+        varchar repository "VARCHAR(1024)"
+        varchar branch "VARCHAR(255) DEFAULT 'main'"
+        varchar folder "VARCHAR(1024) DEFAULT '/'"
+        uuid vcs_id FK "VARCHAR(36) -> vcs.id"
+        uuid organization_id FK "VARCHAR(36) NOT NULL -> organization.id"
+        uuid notification_configuration_id FK "VARCHAR(36) -> notification_configuration.id"
+    }
+
+    POLICY_ATTACHMENT {
+        uuid id PK "VARCHAR(36)"
+        uuid policy_set_id FK "VARCHAR(36) NOT NULL -> policy_set.id"
+        uuid workspace_id FK "VARCHAR(36) -> workspace.id"
+        uuid project_id FK "VARCHAR(36) -> project.id"
+        uuid tag_id FK "VARCHAR(36) -> tag.id"
+    }
+
+    POLICY_EXEMPTION {
+        uuid id PK "VARCHAR(36)"
+        uuid policy_set_id FK "VARCHAR(36) NOT NULL -> policy_set.id"
+        varchar rule_id "VARCHAR(255) NOT NULL"
+        uuid workspace_id FK "VARCHAR(36) -> workspace.id"
+        uuid project_id FK "VARCHAR(36) -> project.id"
+        varchar ticket_reference "VARCHAR(255) NOT NULL"
+        text justification "TEXT NOT NULL (length 2048)"
+        timestamp expires_at "TIMESTAMP"
+        uuid organization_id FK "VARCHAR(36) NOT NULL -> organization.id"
+    }
+
+    POLICY_EVALUATION {
+        uuid id PK "VARCHAR(36)"
+        bigint job_id FK "BIGINT NOT NULL -> job.id"
+        uuid step_id FK "VARCHAR(36) NOT NULL -> step.id"
+        varchar status "VARCHAR(50) NOT NULL [PASSED, WARNING, WAITING_APPROVAL, FAILED]"
+        int passed_rules "INT DEFAULT 0"
+        int warning_rules "INT DEFAULT 0"
+        int soft_mandatory_violations "INT DEFAULT 0"
+        int hard_mandatory_violations "INT DEFAULT 0"
+        int shadow_hard_violations "INT DEFAULT 0"
+        int shadow_soft_violations "INT DEFAULT 0"
+        varchar storage_uri "VARCHAR(1024)"
+    }
+
+    POLICY_OVERRIDE {
+        uuid id PK "VARCHAR(36)"
+        uuid evaluation_id FK "VARCHAR(36) NOT NULL UNIQUE -> policy_evaluation.id"
+        varchar overridden_by "VARCHAR(255) NOT NULL"
+        timestamp overridden_at "TIMESTAMP NOT NULL"
+        text justification "TEXT NOT NULL (length 2048)"
+    }
+
+    WORKSPACE {
+        uuid id PK "VARCHAR(36)"
+        varchar name "VARCHAR(255) NOT NULL"
+        varchar policy_compliance_status "VARCHAR(50) [COMPLIANT, NON_COMPLIANT, OVERRIDDEN, UNKNOWN]"
+        uuid organization_id FK "VARCHAR(36) -> organization.id"
+    }
+
+    JOB {
+        bigint id PK "BIGINT"
+        varchar status "VARCHAR(50)"
+        varchar approval_team "VARCHAR(255)"
+        uuid workspace_id FK "VARCHAR(36) -> workspace.id"
+    }
+
+    STEP {
+        uuid id PK "VARCHAR(36)"
+        bigint job_id FK "BIGINT -> job.id"
+        varchar status "VARCHAR(50)"
+    }
+
+    TEAM {
+        uuid id PK "VARCHAR(36)"
+        boolean manage_policies "BOOLEAN NOT NULL DEFAULT false"
+        uuid organization_id FK "VARCHAR(36) -> organization.id"
+    }
+```
+
 * **`PolicySet`** (`@Entity(name = "policy_set")`):
   Defines bundles of Open Policy Agent (Rego) policies linked to a Git VCS repository (`repository`, `branch`, `folder`), enforcement level (`enforcementLevel`), optional `shadowEnforcementLevel`, `overrideTeam`, `global` boolean flag, and `notificationConfiguration`.
 * **`PolicyAttachment`** (`@Entity(name = "policy_attachment")`):
@@ -67,9 +180,56 @@ All policy entities are Yahoo Elide JSON:API resources mapped under `io.terrakub
 * **`PolicyEvaluation`** (`@Entity(name = "policy_evaluation")`):
   Historical record of policy execution outcomes, violated rules JSON, and timing metrics.
 
+### Entity & Relational Schema Reference
+
+| Entity | Table | Primary Key | Foreign Keys | Relationship & Scoping Invariants |
+| :--- | :--- | :--- | :--- | :--- |
+| **`PolicySet`** | `policy_set` | `id` (UUID / VARCHAR 36) | `organization_id` (NOT NULL), `vcs_id`, `notification_configuration_id` | Core policy unit configuring VCS repo, enforcement level, override team, and global flag. One-to-many with attachments and exemptions. |
+| **`PolicyAttachment`** | `policy_attachment` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL), `workspace_id`, `project_id`, `tag_id` | Scopes non-global policy sets to a specific workspace, project, or tag (mutually exclusive). |
+| **`PolicyExemption`** | `policy_exemption` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL), `organization_id` (NOT NULL), `workspace_id`, `project_id` | Time-bounded rule waiver for specific workspace or project with mandatory ticket reference and justification. |
+| **`PolicyEvaluation`** | `policy_evaluation` | `id` (UUID / VARCHAR 36) | `job_id` (BIGINT NOT NULL), `step_id` (UUID NOT NULL) | Records evaluation results for a specific Terraform plan step (`passed`, `warning`, `soft_mandatory`, `hard_mandatory`, `shadow_*`). 1:1 with `PolicyOverride`. |
+| **`PolicyOverride`** | `policy_override` | `id` (UUID / VARCHAR 36) | `evaluation_id` (UUID NOT NULL UNIQUE) | Immutable audit log capturing who approved a `soft_mandatory` violation and when, with required justification. |
+| **`Workspace`** | `workspace` | `id` (UUID / VARCHAR 36) | `organization_id`, `project_id` | Augmented with `policy_compliance_status` (`COMPLIANT`, `NON_COMPLIANT`, `OVERRIDDEN`, `UNKNOWN`). |
+| **`Team`** | `team` | `id` (UUID / VARCHAR 36) | `organization_id` | Augmented with `manage_policies` (BOOLEAN NOT NULL DEFAULT false) permission column. |
+
 ---
 
-## 3. Yahoo Elide Security Checks & Permission Grammar
+## 3. Policy API & Controller Endpoints
+
+The OPA Policy Governance subsystem exposes two distinct API planes:
+
+### A. Yahoo Elide JSON:API & GraphQL Plane (`/api/v1` & `/graphql/api/v1`)
+All declarative governance entities are managed through Elide JSON:API and GraphQL:
+
+| Endpoint Path | Methods | Resource / Entity | Root-Level? | Elide Security Permissions |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/v1/policy_set`<br/>`/api/v1/organization/{orgId}/policySet` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicySet` (`policy_set`) | Yes (`@Include`) | Read: `team view policy set`<br/>Mutations: `team manage policy set` |
+| `/api/v1/policy_set/{id}/attachments` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicyAttachment` (`policy_attachment`) | No (`@Include(rootLevel = false)`) | Read: `team view policy attachment`<br/>Mutations: `team manage policy attachment` |
+| `/api/v1/policy_exemption`<br/>`/api/v1/organization/{orgId}/policyExemption`<br/>`/api/v1/policy_set/{id}/exemptions` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicyExemption` (`policy_exemption`) | Yes (`@Include`) | Read: `team view policy exemption`<br/>Mutations: `team manage policy exemption` |
+| `/api/v1/job/{jobId}/policyEvaluation`<br/>`/api/v1/step/{stepId}/policyEvaluation` | `GET`<br/>(Mutations via service) | `PolicyEvaluation` (`policy_evaluation`) | No (`@Include(rootLevel = false)`) | Read: `team view policy evaluation`<br/>Mutations: `user is a super service` |
+| `/api/v1/job/{jobId}/policyEvaluation/{evalId}/override` | `GET`, `POST` | `PolicyOverride` (`policy_override`) | No (`@Include(rootLevel = false)`) | Read: `team view policy override`<br/>Create: `team override policy`<br/>Update/Delete: `user is a super service` |
+
+* **GraphQL Endpoint**: `/graphql/api/v1` supports native querying, filtering, and mutations for all policy entities.
+* **Relationship Traversals on Core Entities**:
+  * `Organization`: `/api/v1/organization/{id}/policySet`, `/api/v1/organization/{id}/policyExemption`
+  * `NotificationConfiguration`: `/api/v1/notificationConfiguration/{id}/policySet`
+  * `Job`: `/api/v1/job/{id}/policyEvaluation`
+  * `Step`: `/api/v1/step/{id}/policyEvaluation`
+
+### B. Spring MVC Remote State Plane (`RemoteTfeController.java` under `/api/v2`)
+Provides TFE CLI and external runner compatibility for runtime policy check evaluation, ANSI log streaming, and SecOps override actions:
+
+| Route & HTTP Method | Request / Response Format | Description & Behavior | RBAC / Authorization |
+| :--- | :--- | :--- | :--- |
+| `GET /api/v2/runs/{runId}/policy-checks` | `application/vnd.api+json`<br/>-> `PolicyCheckList` | Lists all policy check evaluations for a given run (`Job`). Automatically strips `run-` prefix. | Authenticated via JWT `principal`. Validates user access to organization/workspace. |
+| `GET /api/v2/policy-checks/{id}` | `application/vnd.api+json`<br/>-> `PolicyCheckData` | Retrieves single policy check details, violation counts, and status. Automatically strips `polchk-` prefix or parses raw UUID. Returns 404 if not found. | Authenticated via JWT `principal`. |
+| `GET /api/v2/policy-checks/{id}/output` | `text/plain` | Streams human-readable ANSI terminal output summarizing passed, advisory, soft-mandatory, and hard-mandatory rules. | Authenticated via JWT `principal`. |
+| `POST /api/v2/policy-checks/{id}/actions/override` | Consumes optional JSON:<br/>`{ "justification": "..." }`<br/>Returns: `PolicyCheckData` | Submits SecOps policy override for a check with `soft_mandatory` violations. Creates immutable `PolicyOverride` audit record, transitions evaluation status to `PASSED`, and enables run resumption. Rejects checks with `hard_mandatory` violations (HTTP 400). | Checked via `validateUserCanOverridePolicy`: User must be an Org Admin or member of configured `overrideTeam`. |
+| `@ExceptionHandler(IllegalArgumentException.class)` | `application/vnd.api+json`<br/>HTTP 400 | Returns standard JSON:API formatted error envelope on malformed IDs or illegal override attempts. | N/A |
+
+---
+
+## 4. Yahoo Elide Security Checks & Permission Grammar
 
 ### Strict Constraint: No Underscores Allowed in Elide Expressions
 Yahoo Elide's expression tokenizer treats underscore characters (`_`) as unrecognized tokens, failing with:
@@ -98,7 +258,7 @@ public class PolicySet extends GenericAuditFields { ... }
 
 ---
 
-## 4. Policy Resolution Lifecycle & Non-Transactional Invariants
+## 5. Policy Resolution Lifecycle & Non-Transactional Invariants
 
 ### 4-Tier Cumulative Resolution (`PolicyResolutionService`)
 When Terrakube dispatches a job, `PolicyResolutionService.resolvePoliciesForJob(Job job)` computes the cumulative set of applicable policies in hierarchical order:
@@ -131,15 +291,84 @@ In Terrakube, `ScheduleJob.doRunExecution` intentionally runs without a surround
 
 ---
 
-## 5. Enforcement Levels & Execution Engine
+## 6. Enforcement Levels & Execution Engine
+
+### In-Runner Execution Lifecycle (Download, Evaluate, Report)
 
 OPA evaluations run in-runner inside the executor (both Kubernetes ephemeral containers and persistent runner processes) on `plan.json` immediately following `terraformPlan`:
 
-| Enforcement Level | Evaluation Outcome | Job Lifecycle & UX Flow |
-| :--- | :--- | :--- |
-| **`advisory`** | Rule failure detected | Logs warning in ANSI yellow. The run continues automatically to Apply or Approval without interruption. |
-| **`soft_mandatory`** | Rule failure detected | Execution pauses. Job transitions to `waitingApproval` with `approvalTeam = overrideTeam`. Authorized SecOps users can approve with a mandatory justification. |
-| **`hard_mandatory`** | Rule failure detected | Execution is strictly blocked. Job transitions to `failed`, logs ANSI red errors, exits code 1, and prevents Terraform Apply. |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Core as API / Quartz Scheduler
+    participant Runner as TerraformExecutorServiceImpl
+    participant OPA as OpaExecutorServiceImpl
+    participant Git as JGit / VCS Provider
+    participant Bin as OpaBinaryService
+    participant Process as OPA CLI Process (opa eval)
+    participant Redis as Redis Stream (Logs / Context)
+    participant API as Terrakube API (ContextController)
+
+    Core->>Runner: Dispatch Job (includes policyList, exemptions, inputs)
+    Runner->>Runner: Run terraformPlan (generates plan.json)
+
+    rect rgb(235, 245, 255)
+        Note over Runner,Git: 1. DOWNLOAD & RESOLUTION PHASE
+        Runner->>OPA: evaluateAllPolicies(job, workingDir, planJsonFile)
+        loop For each PolicyContext in job.policyList
+            OPA->>Git: resolvePolicyBundleDirectory(): JGit shallow clone (depth=1)
+            Git-->>OPA: Cloned into .terrakube-policies/{policyId}
+            OPA->>OPA: resolveLibDirectory(): Locate shared lib/ helpers
+            OPA->>OPA: preparePolicyInputsFile(): Serialize inputs to inputs-{policyId}.json
+            OPA->>Bin: getOpaBinary(version): Acquire arch-specific binary (amd64/arm64)
+        end
+    end
+
+    rect rgb(255, 250, 235)
+        Note over OPA,Process: 2. EVALUATION & FILTERING PHASE
+        loop For each PolicySet
+            OPA->>Process: ProcessBuilder: opa eval --data bundle --data lib --input plan.json data.terraform.analysis
+            Process-->>OPA: JSON stdout (deny, soft_mandatory, warn) + stderr
+            OPA->>OPA: parseOpaJsonOutput(): Extract violations
+            OPA->>OPA: applyExemptions(): Filter active, unexpired exemptions
+            OPA->>OPA: finalizeResultStatus(): Apply enforcement & shadow levels
+        end
+    end
+
+    rect rgb(235, 255, 240)
+        Note over OPA,API: 3. REPORTING & ENFORCEMENT PHASE
+        OPA->>Redis: Stream formatted ANSI color banners (Passed/Soft/Hard)
+        OPA->>API: saveStructuredContext(): POST /context/v1/{jobId} (results, counts)
+        OPA-->>Runner: List<OpaEvaluationResult>
+
+        alt Hard-Mandatory Violations Exist
+            Runner->>Runner: executionPlan = false, exitCode = 1
+            Runner->>Core: Update job status = "failed" (Apply Blocked)
+        else Soft-Mandatory Violations Exist (No Hard)
+            Runner->>Runner: executionPlan = true, setHasSoftMandatoryViolations(true)
+            Runner->>Core: Update job status = "waitingApproval", approvalTeam = overrideTeam
+        else Advisory Warnings or Clean Pass
+            Runner->>Runner: executionPlan = true, exitCode = 0
+            Runner->>Core: Update job status = "pending" (Proceeds to Apply)
+        end
+    end
+```
+
+### Policy Types & Categories Taxonomy
+
+| Dimension | Type / Category | Purpose & Operational Behavior | Typical Use Cases |
+| :--- | :--- | :--- | :--- |
+| **Enforcement Level**<br/>(`PolicyEnforcementLevel` enum) | **`hard_mandatory`** | **Strict Blocker**: Fails the run immediately (`exitCode = 1`), transitions job to `failed`, and strictly halts Apply. Cannot be overridden. | Non-negotiable security (unencrypted storage, 0.0.0.0/0 ingress), compliance mandates. |
+| | **`soft_mandatory`** | **Gated with Override**: Pauses workflow into `waitingApproval`, requires an authorized SecOps team member to submit justification before Apply is unblocked. | Blast radius thresholds, production deployment timing, cross-region infrastructure changes. |
+| | **`advisory`** | **Informational Warning**: Emits ANSI yellow warnings and PR comments but never blocks plan or apply. Runs proceed automatically. | Deprecation notices, naming convention suggestions, non-critical hygiene recommendations. |
+| **Scoping Hierarchy** | **Global Baseline** | Fleet-wide coverage across all workspaces in the organization (`global = true`). | Base tagging, security hygiene, common blast radius limits. |
+| | **Project-Scoped** | Scoped to all workspaces within a business project (`PolicyAttachment.project`). | Departmental policies (e.g. Payments, Data Engineering). |
+| | **Tag-Scoped** | Dynamically targeted to workspaces carrying specific tags (`PolicyAttachment.tag`). | Cloud-specific policies (`cloud:azure`), tier policies (`env:prod`). |
+| | **Workspace-Scoped** | Explicitly pinned to a single workspace (`PolicyAttachment.workspace`). | Workspace-specific architectural exceptions or unique requirements. |
+
+> [!NOTE]
+> **Passive Shadow Evaluation (`shadow_enforcement_level`)**:
+> `shadow` is **not** a distinct enum value in `PolicyEnforcementLevel`. Instead, `shadowEnforcementLevel` is an optional entity field on `PolicySet` (`PolicySet.java:L58`) accepting `HARD_MANDATORY` or `SOFT_MANDATORY`. When populated, the executor passively evaluates rules in shadow mode and records informational violation counts (`shadowHardViolations`, `shadowSoftViolations`) without altering the job outcome or blocking execution.
 
 ### Soft-Mandatory Approval & Suspension Lifecycle
 
@@ -205,7 +434,7 @@ sequenceDiagram
 
 ---
 
-## 6. Terraform Provider Conventions (`terraform-provider-terrakube`)
+## 7. Terraform Provider Conventions (`terraform-provider-terrakube`)
 
 ### Collection Endpoint Naming
 Because Elide entities use `@Entity(name = "policy_set")`, Elide exposes them under snake_case endpoints. Provider HTTP client calls must match:
@@ -252,7 +481,7 @@ Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terr
 
 ---
 
-## 7. Testing & Verification
+## 8. Testing & Verification
 
 1. **Policy Bundles**:
    Validate Rego rules with Regal and `opa test`:
@@ -267,3 +496,46 @@ Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terr
    ```
 3. **Fleet Terraform Testing**:
    Run `terraform plan` and `terraform apply` in `terrakube-governance` to provision workspaces, policy sets, and attachments.
+
+---
+
+## 9. Continuous Compliance & Maintenance Schedulers (Drift & Retention)
+
+Terrakube provides two specialized Quartz background jobs to maintain continuous workspace compliance and database audit health:
+
+### 1. Policy Drift Evaluation (`PolicyDriftEvaluationJob`)
+* **Purpose**: Detects policy compliance drift across all workspaces when policies are updated, new policy sets are attached, or exemptions expire, without requiring developers to push code or manually trigger a run.
+* **Schedule**: Configured via `io.terrakube.policy.drift.cron` (default: `0 0 2 * * ?` -> 2:00 AM daily).
+* **Workspace Filtering & Guardrails**:
+  1. Skips workspaces that are `deleted`, `locked`, or have status `NeverExecuted`.
+  2. Retrieves the latest completed run with a valid `terraformPlan` URL (`findFirstByWorkspaceAndAndStatusInOrderByIdDesc`). If no completed plan exists, the workspace is safely skipped.
+  3. Resolves applicable policies using `PolicyResolutionService`. If no policies match, the workspace is skipped.
+* **Headless TCL Execution Flow**:
+  - Dispatches a lightweight job with `FlowType.policyEvaluation`:
+    ```yaml
+    flow:
+      - type: policyEvaluation
+        step: 100
+        name: OPA Policy Drift Evaluation
+    ```
+  - **Executor Optimization**: In `SetupWorkspaceImpl`, the executor detects `"policyEvaluation"` and **bypasses workspace git clone and tarball download**.
+  - `OpaExecutorServiceImpl.evaluateJob()` downloads `plan.json` directly from storage and evaluates all policy sets against it.
+  - Updates `Workspace.policyComplianceStatus` (`COMPLIANT`, `NON_COMPLIANT`, `OVERRIDDEN`) and records `PolicyEvaluation` entries without altering live workspace state.
+
+### 2. Audit Retention & Pruning (`PolicyEvaluationRetentionJob`)
+* **Purpose**: Enforces enterprise data retention policies and prevents unbounded database growth from daily drift evaluations and historical plan runs.
+* **Schedule**: Configured via `io.terrakube.policy.evaluation.retentionCron` (default: `0 0 4 * * ?` -> 4:00 AM daily).
+* **Retention Window**: Configured via `io.terrakube.policy.evaluation.retentionDays` (default: `90` days).
+* **Execution & Cascade Order**:
+  1. Computes cutoff timestamp: `System.currentTimeMillis() - (retentionDays * 86,400,000L)`.
+  2. First deletes child records: `policyOverrideRepository.deleteByCreatedDateBefore(cutoff)`.
+  3. Then deletes parent evaluations: `policyEvaluationRepository.deleteByCreatedDateBefore(cutoff)`.
+  4. Runs under `@DisallowConcurrentExecution` to prevent concurrent sweep race conditions.
+
+### Configuration Properties Reference
+
+| Property | Default Value | Description |
+| :--- | :--- | :--- |
+| `io.terrakube.policy.drift.cron` | `0 0 2 * * ?` | Cron expression for the nightly policy drift evaluation sweep. |
+| `io.terrakube.policy.evaluation.retentionCron` | `0 0 4 * * ?` | Cron expression for the nightly policy evaluation retention cleanup sweep. |
+| `io.terrakube.policy.evaluation.retentionDays` | `90` | Number of days to retain historical `PolicyEvaluation` and `PolicyOverride` records. |
