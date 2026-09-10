@@ -434,7 +434,90 @@ sequenceDiagram
 
 ---
 
-## 7. Terraform Provider Conventions (`terraform-provider-terrakube`)
+## 7. Policy Exemption Architecture & Runner Evaluation Lifecycle
+
+Terrakube supports time-bounded and permanent compliance waivers (**Policy Exemptions**) that permit specific Rego rule violations to be bypassed without disabling the entire policy set or halting CI/CD runs.
+
+### 1. Domain Model & Scoping Hierarchy
+Policy exemptions are modeled via `PolicyExemption` (`@Entity(name = "policy_exemption")`):
+* **Scoping Levels**:
+  * **Organization-Wide**: `workspace == null && project == null` — Waives rule across all workspaces and projects in the organization.
+  * **Project-Scoped**: `project != null && workspace == null` — Inherited by all workspaces belonging to the targeted project.
+  * **Workspace-Scoped**: `workspace != null` — Applies exclusively to the targeted workspace.
+* **Fields**:
+  * `ruleId`: Target Rego rule identifier evaluated by OPA (e.g. `aws_s3_bucket_no_public_access`).
+  * `ticketReference`: Audited issue tracker or change ticket reference (e.g. `SEC-8842` or Jira link).
+  * `justification`: Detailed explanation of why the compliance exception was granted (up to 2048 chars).
+  * `expiresAt`: Optional expiration date & time. If `null`, the waiver is permanent/indefinite.
+  * `policySet`: Associated `PolicySet` containing the rule.
+
+### 2. Permissions & Security Invariants
+* **Governance Permission**: Governed by `team.manage_policies` (`rbacService.canManagePolicies(team)`).
+* **Authorized Roles**: Organization Admins (`ROLE_ADMIN`), Custom Roles with `managePolicies = true`, and `instanceOwner`.
+* **Elide Security Check Expressions**:
+  * Read: `@ReadPermission(expression = "team view policy exemption")`
+  * Mutations: `@CreatePermission / @UpdatePermission / @DeletePermission(expression = "team manage policy exemption")`
+* **Token Controller Endpoints**: `TeamTokenController` exposes `managePolicies` in `PermissionSet` across both `/permissions/organization/{organizationId}` and `/permissions/organization/{organizationId}/workspace/{workspaceId}`.
+
+### 3. API Resolution Phase (`PolicyResolutionService`)
+During job dispatch or headless evaluation, `ExecutorService` invokes:
+```java
+public List<PolicyExemptionContext> resolveExemptionsForJob(Job job)
+```
+1. Active exemptions are retrieved via `PolicyExemptionRepository.findActiveExemptionsForWorkspace`:
+   ```sql
+   SELECT pe FROM policy_exemption pe WHERE pe.organization = :org
+     AND (pe.expiresAt IS NULL OR pe.expiresAt > :now)
+     AND (pe.workspace = :workspace
+          OR (pe.project IS NOT NULL AND pe.project = :project)
+          OR (pe.workspace IS NULL AND pe.project IS NULL))
+   ```
+2. Resulting entities are mapped to immutable `PolicyExemptionContext` DTOs containing `exemptionId`, `policySetId`, `ruleId`, `ticketReference`, `justification`, and `expiresAt`.
+3. Attached to `ExecutorContext.policyExemptionList` and serialized into the `TerraformJob` payload.
+
+### 4. Runner Evaluation & In-Runner Filtering (`OpaExecutorServiceImpl`)
+During in-runner policy execution in `OpaExecutorServiceImpl`:
+1. **Raw Evaluation**: OPA evaluates `plan.json` against policy bundles and produces raw violations in `OpaEvaluationResult.getViolations()`.
+2. **Filtering via `applyExemptions()`**:
+   Matches violations against the job's `exemptions` list where:
+   * `e.getPolicySetId().equals(policySetId)`
+   * `e.getRuleId().equals(violation.getRuleId())`
+   * Defense-in-depth unexpired check: `e.getExpiresAt() == null || e.getExpiresAt().after(now)`
+3. **Bypassing Violation**:
+   * Removed from `result.getViolations()`.
+   * Violation status updated to `ViolationStatus.EXEMPTED`.
+   * Audit metadata (`ticketReference`, `justification`, `expiresAt`) attached.
+   * Added to `result.getExemptedViolations()`.
+   * Emits ANSI audit log:
+     ```text
+     [EXEMPTED] Rule '<ruleId>' bypassed on '<address>' (Ticket: <ticket>, Expires: <date|Indefinite>)
+     ```
+4. **Finalization (`finalizeResultStatus`)**:
+   * Hard and soft mandatory counts are calculated **only** from the remaining violations in `result.getViolations()`.
+   * If all blocking violations are bypassed, the policy set passes.
+   * If any violations were exempted, the runner prints an audit summary banner:
+     ```text
+     🛡️ [EXEMPTIONS ACTIVE] N rule violation(s) bypassed via approved active exemptions.
+     ```
+   * VCS PR comment reflects status: `PASSED (WITH EXEMPTION)`.
+
+### 5. Web Console Management (`terrakube/ui`)
+* **Organization Settings** (`/organizations/:orgid/settings/policies?tab=exemptions`):
+  * Filter bar supporting text search, status dropdown (`All`, `Active`, `Expiring Soon`, `Expired`, `Permanent`) with count badges, scope dropdown, and policy set dropdown.
+  * Tabular display with copyable rule IDs, policy set tags, scope badges, ticket references, expiration badges, and Edit / Revoke actions.
+* **Workspace Settings** (`/organizations/:orgid/workspaces/:id/settings/policies`):
+  * Displays active exemptions applying to the workspace (distinguishing local vs inherited org/project waivers).
+  * "+ Add Exemption" button pre-locked to the current workspace.
+* **Run Violation Inspector** (`PolicyChecksOutput.tsx`):
+  * "Add Exemption" shortcut on violation rows (`hard_mandatory` or `soft_mandatory`), pre-filling rule ID, policy set, and workspace.
+  * Success prompt offers immediate "Evaluate Policies Now" action to re-run headless evaluation without triggering a full pipeline.
+* **Modal UX Standards**:
+  * Permanent / Indefinite exemption toggle backed by React state + Ant Design `Form.Item(valuePropName="checked")` with clickable label text.
+  * Quick expiration duration presets: `+30 Days`, `+60 Days`, `+90 Days`, `+1 Year`.
+
+---
+
+## 8. Terraform Provider Conventions (`terraform-provider-terrakube`)
 
 ### Collection Endpoint Naming
 Because Elide entities use `@Entity(name = "policy_set")`, Elide exposes them under snake_case endpoints. Provider HTTP client calls must match:
@@ -481,7 +564,7 @@ Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terr
 
 ---
 
-## 8. Testing & Verification
+## 9. Testing & Verification
 
 1. **Policy Bundles**:
    Validate Rego rules with Regal and `opa test`:
@@ -499,7 +582,7 @@ Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terr
 
 ---
 
-## 9. Continuous Compliance & Maintenance Schedulers (Drift & Retention)
+## 10. Continuous Compliance & Maintenance Schedulers (Drift & Retention)
 
 Terrakube provides two specialized Quartz background jobs to maintain continuous workspace compliance and database audit health:
 
@@ -534,8 +617,10 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
 
 ### Configuration Properties Reference
 
-| Property | Default Value | Description |
-| :--- | :--- | :--- |
-| `io.terrakube.policy.drift.cron` | `0 0 2 * * ?` | Cron expression for the nightly policy drift evaluation sweep. |
-| `io.terrakube.policy.evaluation.retentionCron` | `0 0 4 * * ?` | Cron expression for the nightly policy evaluation retention cleanup sweep. |
-| `io.terrakube.policy.evaluation.retentionDays` | `90` | Number of days to retain historical `PolicyEvaluation` and `PolicyOverride` records. |
+| Property | Environment Variable | Default Value | Description |
+| :--- | :--- | :--- | :--- |
+| `io.terrakube.policy.drift.cron` | `PolicyDriftCron` | `0 0 2 * * ?` | Cron expression for the nightly policy drift evaluation sweep. |
+| `io.terrakube.policy.evaluation.retentionCron` | `PolicyEvaluationRetentionCron` | `0 0 4 * * ?` | Cron expression for the nightly policy evaluation retention cleanup sweep. |
+| `io.terrakube.policy.evaluation.retentionDays` | `PolicyEvaluationRetentionDays` | `90` | Number of days to retain historical `PolicyEvaluation` and `PolicyOverride` records. |
+| `io.terrakube.executor.opa.concurrency.core` | `ExecutorOpaConcurrencyCore` | `8` | Core thread pool size for in-runner parallel OPA policy evaluation. |
+| `io.terrakube.executor.opa.concurrency.max` | `ExecutorOpaConcurrencyMax` | `16` | Maximum thread pool size for in-runner parallel OPA policy evaluation. |

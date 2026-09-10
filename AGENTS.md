@@ -66,8 +66,8 @@
 ## 13. OPA Policy Governance & Fleet Architecture (`io.terrakube.api.plugin.policy`)
 * Policy governance enforces guardrails via in-runner OPA evaluation on `plan.json` across three enforcement levels (`advisory`, `soft_mandatory`, `hard_mandatory`).
 * PolicySets and PolicyAttachments MUST be managed via Terraform using `terrakube_policy_set` and `terrakube_policy_attachment`.
-* Elide security check expressions for policies MUST use space-separated words without underscores (`team view policy set`, `team manage policy set`, `team override policy`).
-* Resolution services running within background jobs (Quartz `ScheduleJob`) MUST NOT access lazy collections on detached entities; all tag, variable, and attachment queries must use dedicated repository methods (`workspaceTagRepository.findByWorkspace(...)`).
+* Elide security check expressions for policies MUST use space-separated words without underscores (`team view policy set`, `team manage policy set`, `team override policy`, `team view policy exemption`, `team manage policy exemption`).
+* Policy exemptions are scoped across three tiers (organization, project, workspace) and evaluated in-runner during policy execution by bypassing matching unexpired rule violations without altering blocking violations.
 * Guidelines: .agents/skills/terrakube-opa-policy-governance/SKILL.md
 
 ## 14. Notification System & Webhook Outbox Architecture (`io.terrakube.api.plugin.notification`)
