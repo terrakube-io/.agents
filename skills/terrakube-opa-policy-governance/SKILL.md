@@ -589,12 +589,26 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
 ### 1. Policy Drift Evaluation (`PolicyDriftEvaluationJob`)
 * **Purpose**: Detects policy compliance drift across all workspaces when policies are updated, new policy sets are attached, or exemptions expire, without requiring developers to push code or manually trigger a run.
 * **Schedule**: Configured via `io.terrakube.policy.drift.cron` (default: `0 0 2 * * ?` -> 2:00 AM daily).
-* **Workspace Filtering & Guardrails**:
-  1. Skips workspaces that are `deleted`, `locked`, or have status `NeverExecuted`.
-  2. Retrieves the latest completed run with a valid `terraformPlan` URL (`findFirstByWorkspaceAndAndStatusInOrderByIdDesc`). If no completed plan exists, the workspace is safely skipped.
-  3. Resolves applicable policies using `PolicyResolutionService`. If no policies match, the workspace is skipped.
+* **Stability, Memory & Queue Protection Architecture**:
+  1. **Paginated Database Scanning (`PageRequest`)**:
+     - Uses chunked repository queries (`workspaceRepository.findAll(PageRequest.of(pageNumber, batchSize))`, default `batchSize=50`).
+     - Eliminates JVM heap spikes across installations with thousands of workspaces compared to unpaged `findAll()`.
+  2. **Active Concurrency Window (Backpressure Gate)**:
+     - Quartz operates on a small thread pool (default 8 worker threads: `io.terrakube.scheduler.thread-count: 8`). Because each dispatched job registers a 30-second recurring Quartz trigger (`ScheduleJob`), flooding the queue with drift jobs saturates the pool and starves notification outbox dispatchers, webhook deliveries, and user runs.
+     - Tracks active drift jobs via `jobRepository.countByViaAndStatusIn("Drift", List.of(pending, queue, running))`.
+     - Strictly caps in-flight drift jobs to `maxActiveJobs` (default: `5`). When the ceiling is reached, scanning halts immediately to release the Quartz thread.
+  3. **Stateless Workspace Skipping & Cooldown**:
+     - **Active Run Skip**: Workspaces with any non-terminal active job (`jobRepository.findActiveJobIdsByWorkspace`) are skipped to prevent workspace queue blockages.
+     - **Drift Cooldown**: Workspaces whose latest run was a drift evaluation within `cooldownHours` (default: `12` hours) are skipped. This ensures multi-stage follow-up runs only evaluate uninspected workspaces without requiring stateful database cursor tracking.
+  4. **Self-Scheduled Follow-Up Trigger**:
+     - When the concurrency ceiling (`maxActiveJobs`) or batch limit (`maxJobsPerRun`, default: `100`) is hit and uninspected workspaces remain, the job automatically schedules a one-off Quartz follow-up trigger (`TerrakubeV2_PolicyDriftEvaluation_FollowUp`) to run in `followUpDelayMinutes` (default: `2` minutes) via `context.getScheduler()`.
+     - This resumes progress once active jobs finish without blocking or sleeping within the Quartz worker thread.
+  5. **Workspace Filtering & Applicability**:
+     - Skips workspaces that are `deleted`, `locked`, or have status `NeverExecuted`.
+     - Retrieves the latest completed run with a valid `terraformPlan` URL (`findFirstByWorkspaceAndAndStatusInOrderByIdDesc`). If no completed plan exists, the workspace is safely skipped.
+     - Resolves applicable policies using `PolicyResolutionService`. If no policies match, the workspace is skipped.
 * **Headless TCL Execution Flow**:
-  - Dispatches a lightweight job with `FlowType.policyEvaluation`:
+  - Dispatches a lightweight job with `FlowType.policyEvaluation` tagged with `via="Drift"`:
     ```yaml
     flow:
       - type: policyEvaluation
@@ -620,6 +634,11 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
 | Property | Environment Variable | Default Value | Description |
 | :--- | :--- | :--- | :--- |
 | `io.terrakube.policy.drift.cron` | `PolicyDriftCron` | `0 0 2 * * ?` | Cron expression for the nightly policy drift evaluation sweep. |
+| `io.terrakube.policy.drift.batchSize` | `PolicyDriftBatchSize` | `50` | Page size for paginated workspace database queries. |
+| `io.terrakube.policy.drift.maxJobsPerRun` | `PolicyDriftMaxJobsPerRun` | `100` | Maximum number of drift evaluation jobs dispatched per execution run. |
+| `io.terrakube.policy.drift.maxActiveJobs` | `PolicyDriftMaxActiveJobs` | `5` | Concurrency ceiling for in-flight drift jobs (`pending`, `queue`, `running`) to prevent Quartz thread saturation. |
+| `io.terrakube.policy.drift.followUpDelayMinutes` | `PolicyDriftFollowUpDelayMinutes` | `2` | Delay in minutes before scheduling a follow-up trigger when concurrency limit is hit with remaining workspaces. |
+| `io.terrakube.policy.drift.cooldownHours` | `PolicyDriftCooldownHours` | `12` | Cooldown period during which a workspace with a recent drift run is skipped. |
 | `io.terrakube.policy.evaluation.retentionCron` | `PolicyEvaluationRetentionCron` | `0 0 4 * * ?` | Cron expression for the nightly policy evaluation retention cleanup sweep. |
 | `io.terrakube.policy.evaluation.retentionDays` | `PolicyEvaluationRetentionDays` | `90` | Number of days to retain historical `PolicyEvaluation` and `PolicyOverride` records. |
 | `io.terrakube.executor.opa.concurrency.core` | `ExecutorOpaConcurrencyCore` | `8` | Core thread pool size for in-runner parallel OPA policy evaluation. |
