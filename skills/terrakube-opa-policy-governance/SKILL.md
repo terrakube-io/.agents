@@ -619,15 +619,26 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
   - `OpaExecutorServiceImpl.evaluateJob()` downloads `plan.json` directly from storage and evaluates all policy sets against it.
   - Updates `Workspace.policyComplianceStatus` (`COMPLIANT`, `NON_COMPLIANT`, `OVERRIDDEN`) and records `PolicyEvaluation` entries without altering live workspace state.
 
-### 2. Audit Retention & Pruning (`PolicyEvaluationRetentionJob`)
-* **Purpose**: Enforces enterprise data retention policies and prevents unbounded database growth from daily drift evaluations and historical plan runs.
+### 2. Audit Retention & Storage Pruning (`PolicyEvaluationRetentionJob`)
+* **Purpose**: Enforces enterprise data retention policies and prevents unbounded database and object storage growth from daily drift evaluations and historical plan runs.
+* **Storage Offload Lifecycle**:
+  - **Offload on Evaluation**: When a job evaluation completes, `PolicyEvaluationService` offloads the verbose violation details (`evalNode.get("results")`) to object storage via `storageTypeService.uploadPolicyEvaluation(storageUri, resultsJson)` at `policy-evaluations/<jobId>/violations.json`.
+  - **Metadata in PostgreSQL**: The `policy_evaluation` relational entity only stores summary integer metrics (`passed_rules`, `warning_rules`, `soft_mandatory_violations`, `hard_mandatory_violations`, `shadow_*`), status, and a pointer `storage_uri`.
+  - **Storage Deletion Requirement**: Because `storage_uri` points to external cloud/local object storage (AWS S3, Azure Blob, GCP Storage, Local filesystem), database-only deletions leave orphaned objects accumulating in storage buckets indefinitely.
 * **Schedule**: Configured via `io.terrakube.policy.evaluation.retentionCron` (default: `0 0 4 * * ?` -> 4:00 AM daily).
 * **Retention Window**: Configured via `io.terrakube.policy.evaluation.retentionDays` (default: `90` days).
 * **Execution & Cascade Order**:
-  1. Computes cutoff timestamp: `System.currentTimeMillis() - (retentionDays * 86,400,000L)`.
-  2. First deletes child records: `policyOverrideRepository.deleteByCreatedDateBefore(cutoff)`.
-  3. Then deletes parent evaluations: `policyEvaluationRepository.deleteByCreatedDateBefore(cutoff)`.
-  4. Runs under `@DisallowConcurrentExecution` to prevent concurrent sweep race conditions.
+  1. Computes cutoff timestamp: `cutoff = new Date(System.currentTimeMillis() - retentionMillis)`.
+  2. **Storage Object Pruning**:
+     - Queries distinct storage URIs for evaluations created before cutoff:
+       `policyEvaluationRepository.findStorageUrisByCreatedDateBefore(cutoff)`
+     - Iterates through the list and invokes `storageTypeService.deletePolicyEvaluation(uri)` to delete the file from object storage (S3 bucket, Azure container, GCP bucket, or local disk).
+     - Individual deletions are isolated in `try-catch` blocks: failure to delete one remote file logs a warning and does not abort remaining file deletions or database record pruning.
+  3. **Child Database Pruning**: Deletes dependent override records:
+     `policyOverrideRepository.deleteByCreatedDateBefore(cutoff)`.
+  4. **Parent Database Pruning**: Deletes evaluation records:
+     `policyEvaluationRepository.deleteByCreatedDateBefore(cutoff)`.
+  5. **Concurrency Protection**: Annotated with `@DisallowConcurrentExecution` so multiple Quartz worker threads never run overlapping sweeps.
 
 ### Configuration Properties Reference
 
