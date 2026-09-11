@@ -624,3 +624,58 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
 | `io.terrakube.policy.evaluation.retentionDays` | `PolicyEvaluationRetentionDays` | `90` | Number of days to retain historical `PolicyEvaluation` and `PolicyOverride` records. |
 | `io.terrakube.executor.opa.concurrency.core` | `ExecutorOpaConcurrencyCore` | `8` | Core thread pool size for in-runner parallel OPA policy evaluation. |
 | `io.terrakube.executor.opa.concurrency.max` | `ExecutorOpaConcurrencyMax` | `16` | Maximum thread pool size for in-runner parallel OPA policy evaluation. |
+
+---
+
+## 11. OPA Violation Notifications & Transactional Outbox Integration
+
+Terrakube integrates OPA Policy Governance with the Notification engine across two distinct operational planes:
+
+```mermaid
+flowchart TD
+    subgraph OPAEval ["1. Evaluation & Ingestion"]
+        Runner["In-Runner OPA Engine\n(Evaluates plan.json)"] --> ContextUpload["POST /context/v1/{jobId}\n(ContextController)"]
+        ContextUpload --> EvalService["PolicyEvaluationService.processPolicyEvaluationContext()"]
+    end
+
+    subgraph DecisionRouter ["2. Dual Notification Paths"]
+        EvalService -->|hard > 0 or soft > 0| PolicyNotif["PolicyNotificationService\n(Direct PolicySet Binding)"]
+        EvalService --> StatusChange["Job Status Decision\n(waitingApproval / failed)"]
+        StatusChange --> JobTrigger["JobNotificationTrigger\n(General Org/Workspace Triggers)"]
+    end
+
+    subgraph OutboxEngine ["3. Resilient Delivery"]
+        PolicyNotif --> Outbox[("notification_outbox\n(status: PENDING)")]
+        JobTrigger --> Outbox
+        Outbox --> Worker["Async Dispatcher /\nQuartz Poller"]
+        Worker --> SSRF["DestinationUrlValidator\n(Zero-Trust SSRF Check)"]
+        SSRF --> HTTP["NotificationDeliveryService\n(HTTP Call Outside DB Tx)"]
+    end
+```
+
+### 1. Dual Notification Pathways
+1. **Direct PolicySet Binding (Micro / Compliance Alerts)**:
+   * `PolicySet` holds `@ManyToOne @JoinColumn(name = "notification_configuration_id") private NotificationConfiguration notificationConfiguration`.
+   * Enables dedicated routing of specific compliance bundles (e.g., PCI-DSS, security guardrails) directly to designated channels (e.g. `#secops-compliance` or security SIEM webhooks) independent of workspace-level notification settings.
+2. **Workflow State Orchestration (Macro / Job Lifecycle Alerts)**:
+   * Soft-mandatory violations pause the job in `JobStatus.waitingApproval` and assign `job.approvalTeam = overrideTeam`.
+   * Hard-mandatory violations abort the job into `JobStatus.failed`.
+   * Triggers general organization and workspace notification configurations subscribed to `waitingApproval` or `failed`.
+
+### 2. Processing Pipeline (`PolicyEvaluationService` -> `PolicyNotificationService`)
+1. In `ContextController.saveContext`, the uploaded payload triggers `PolicyEvaluationService.processPolicyEvaluationContext(jobId, sanitizedContext)`.
+2. When `softViolations > 0` or `hardViolations > 0`, the service queries applicable policy sets and invokes `PolicyNotificationService.sendPolicyViolationNotification(job, orgPolicySets, reason)`.
+3. `PolicyNotificationService`:
+   * Identifies policy sets with an active `NotificationConfiguration`.
+   * Assembles `NotificationContext` with run URL, workspace URL, commit ID, job status, and violation summary reason.
+   * Renders the message payload via `NotificationPayloadRenderer` (Slack Block Kit, Teams Adaptive Cards, or Webhook JSON).
+   * Inserts an outbox row into `notification_outbox` with `status = PENDING`.
+
+### 3. Drift Compliance Notifications
+* Nightly `PolicyDriftEvaluationJob` re-evaluates historical `plan.json` files against updated policies and expiring exemptions without user commits.
+* Headless execution posts back to `ContextController`, automatically updating workspace compliance status and dispatching policy violation notifications if drift occurs.
+
+### 4. Transactional Outbox Invariants
+* Delivery HTTP requests execute outside DB transactions to prevent connection pool exhaustion.
+* All destination URLs undergo SSRF validation via `DestinationUrlValidator` before transmission.
+

@@ -163,3 +163,7 @@ flowchart TD
 * **UI**:
   * Organization-wide notifications: `/organizations/{orgId}/settings/notifications`
   * Workspace-scoped notifications & delivery history: `/organizations/{orgId}/workspaces/{wsId}/settings/notifications`
+* **OPA Policy Governance (`io.terrakube.api.plugin.policy`)**:
+  * Policy sets can bind directly to a dedicated `NotificationConfiguration` (`PolicySet.notificationConfiguration`).
+  * `PolicyEvaluationService` and `PolicyNotificationService` stage violation alerts directly into `notification_outbox` whenever hard or soft violations are detected.
+  * Policy enforcement state transitions (`waitingApproval` for soft-mandatory, `failed` for hard-mandatory) automatically trigger workspace- and org-level notification triggers.
