@@ -95,6 +95,7 @@ erDiagram
         varchar repository "VARCHAR(1024)"
         varchar branch "VARCHAR(255) DEFAULT 'main'"
         varchar folder "VARCHAR(1024) DEFAULT '/'"
+        varchar opa_version "VARCHAR(50)"
         uuid vcs_id FK "VARCHAR(36) -> vcs.id"
         uuid organization_id FK "VARCHAR(36) NOT NULL -> organization.id"
         uuid notification_configuration_id FK "VARCHAR(36) -> notification_configuration.id"
@@ -170,7 +171,7 @@ erDiagram
 ```
 
 * **`PolicySet`** (`@Entity(name = "policy_set")`):
-  Defines bundles of Open Policy Agent (Rego) policies linked to a Git VCS repository (`repository`, `branch`, `folder`), enforcement level (`enforcementLevel`), optional `shadowEnforcementLevel`, `overrideTeam`, `global` boolean flag, and `notificationConfiguration`.
+  Defines bundles of Open Policy Agent (Rego) policies linked to a Git VCS repository (`repository`, `branch`, `folder`), optional OPA binary version (`opaVersion`), enforcement level (`enforcementLevel`), optional `shadowEnforcementLevel`, `overrideTeam`, `global` boolean flag, and `notificationConfiguration`.
 * **`PolicyAttachment`** (`@Entity(name = "policy_attachment")`):
   Scopes a `PolicySet` to a specific `workspace`, `project`, or `tag` (mutually exclusive). Global policy sets do not require attachments.
 * **`PolicyExemption`** (`@Entity(name = "policy_exemption")`):
