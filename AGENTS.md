@@ -95,3 +95,10 @@
 * Administrative teams (e.g. `TERRAKUBE_ADMIN`) MUST have `role="admin"` and all boolean flags set to `true`.
 * Guidelines: .agents/skills/terrakube-rbac-permissions/SKILL.md
 
+## 17. Terrakube UI (`terrakube/ui`)
+* The Terrakube UI application must be developed in `terrakube/ui` using `yarn`.
+* Linting and formatting in CI strictly enforce ESLint and Prettier (`yarn lint:modules:check`, `yarn format:modules:check`). Run `yarn lint:modules` to auto-fix formatting issues.
+* Unused variables and imports MUST be eliminated to satisfy `@typescript-eslint/no-unused-vars`.
+* Always use non-interactive Jest execution (`yarn test --watchAll=false` or `CI=true yarn test`) when running tests in automated environments.
+* Guidelines: .agents/skills/terrakube-ui/SKILL.md
+
