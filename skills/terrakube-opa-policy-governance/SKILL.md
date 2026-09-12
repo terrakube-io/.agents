@@ -69,6 +69,7 @@ erDiagram
 
     POLICY_SET ||--o{ POLICY_ATTACHMENT : "scopes via (1:N)"
     POLICY_SET ||--o{ POLICY_EXEMPTION : "waives rules in (1:N)"
+    POLICY_SET ||--o{ POLICY_SET_PARAMETER : "configures (1:N)"
 
     POLICY_ATTACHMENT }o--o| WORKSPACE : "targets workspace (0..1:1)"
     POLICY_ATTACHMENT }o--o| PROJECT : "targets project (0..1:1)"
@@ -99,6 +100,14 @@ erDiagram
         uuid vcs_id FK "VARCHAR(36) -> vcs.id"
         uuid organization_id FK "VARCHAR(36) NOT NULL -> organization.id"
         uuid notification_configuration_id FK "VARCHAR(36) -> notification_configuration.id"
+    }
+
+    POLICY_SET_PARAMETER {
+        uuid id PK "VARCHAR(36)"
+        uuid policy_set_id FK "VARCHAR(36) NOT NULL -> policy_set.id"
+        varchar parameter_key "VARCHAR(255) NOT NULL"
+        text parameter_value "TEXT NOT NULL"
+        text description "TEXT"
     }
 
     POLICY_ATTACHMENT {
@@ -171,7 +180,9 @@ erDiagram
 ```
 
 * **`PolicySet`** (`@Entity(name = "policy_set")`):
-  Defines bundles of Open Policy Agent (Rego) policies linked to a Git VCS repository (`repository`, `branch`, `folder`), optional OPA binary version (`opaVersion`), enforcement level (`enforcementLevel`), optional `shadowEnforcementLevel`, `overrideTeam`, `global` boolean flag, and `notificationConfiguration`.
+  Defines bundles of Open Policy Agent (Rego) policies linked to a Git VCS repository (`repository`, `branch`, `folder`), optional OPA binary version (`opaVersion`), enforcement level (`enforcementLevel`), optional `shadowEnforcementLevel`, `overrideTeam`, `global` boolean flag, and `notificationConfiguration`. One-to-many with attachments, exemptions, and parameters.
+* **`PolicySetParameter`** (`@Entity(name = "policy_set_parameter")`):
+  Defines configuration inputs directly on a `PolicySet` (`parameter_key`, `parameter_value`, `description`), injected into in-runner OPA evaluations with JSON-aware typing.
 * **`PolicyAttachment`** (`@Entity(name = "policy_attachment")`):
   Scopes a `PolicySet` to a specific `workspace`, `project`, or `tag` (mutually exclusive). Global policy sets do not require attachments.
 * **`PolicyExemption`** (`@Entity(name = "policy_exemption")`):
@@ -185,7 +196,8 @@ erDiagram
 
 | Entity | Table | Primary Key | Foreign Keys | Relationship & Scoping Invariants |
 | :--- | :--- | :--- | :--- | :--- |
-| **`PolicySet`** | `policy_set` | `id` (UUID / VARCHAR 36) | `organization_id` (NOT NULL), `vcs_id`, `notification_configuration_id` | Core policy unit configuring VCS repo, enforcement level, override team, and global flag. One-to-many with attachments and exemptions. |
+| **`PolicySet`** | `policy_set` | `id` (UUID / VARCHAR 36) | `organization_id` (NOT NULL), `vcs_id`, `notification_configuration_id` | Core policy unit configuring VCS repo, enforcement level, override team, and global flag. One-to-many with attachments, exemptions, and parameters. |
+| **`PolicySetParameter`** | `policy_set_parameter` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL) | Isolated parameters directly configured on a policy set with JSON-aware runtime typing. |
 | **`PolicyAttachment`** | `policy_attachment` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL), `workspace_id`, `project_id`, `tag_id` | Scopes non-global policy sets to a specific workspace, project, or tag (mutually exclusive). |
 | **`PolicyExemption`** | `policy_exemption` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL), `organization_id` (NOT NULL), `workspace_id`, `project_id` | Time-bounded rule waiver for specific workspace or project with mandatory ticket reference and justification. |
 | **`PolicyEvaluation`** | `policy_evaluation` | `id` (UUID / VARCHAR 36) | `job_id` (BIGINT NOT NULL), `step_id` (UUID NOT NULL) | Records evaluation results for a specific Terraform plan step (`passed`, `warning`, `soft_mandatory`, `hard_mandatory`, `shadow_*`). 1:1 with `PolicyOverride`. |
@@ -206,6 +218,7 @@ All declarative governance entities are managed through Elide JSON:API and Graph
 | :--- | :--- | :--- | :--- | :--- |
 | `/api/v1/policy_set`<br/>`/api/v1/organization/{orgId}/policySet` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicySet` (`policy_set`) | Yes (`@Include`) | Read: `team view policy set`<br/>Mutations: `team manage policy set` |
 | `/api/v1/policy_set/{id}/attachments` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicyAttachment` (`policy_attachment`) | No (`@Include(rootLevel = false)`) | Read: `team view policy attachment`<br/>Mutations: `team manage policy attachment` |
+| `/api/v1/policy_set/{id}/parameters` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicySetParameter` (`policy_set_parameter`) | No (`@Include(rootLevel = false)`) | Read: `team view policy set`<br/>Mutations: `team manage policy set` |
 | `/api/v1/policy_exemption`<br/>`/api/v1/organization/{orgId}/policyExemption`<br/>`/api/v1/policy_set/{id}/exemptions` | `GET`, `POST`, `PATCH`, `DELETE` | `PolicyExemption` (`policy_exemption`) | Yes (`@Include`) | Read: `team view policy exemption`<br/>Mutations: `team manage policy exemption` |
 | `/api/v1/job/{jobId}/policyEvaluation`<br/>`/api/v1/step/{stepId}/policyEvaluation` | `GET`<br/>(Mutations via service) | `PolicyEvaluation` (`policy_evaluation`) | No (`@Include(rootLevel = false)`) | Read: `team view policy evaluation`<br/>Mutations: `user is a super service` |
 | `/api/v1/job/{jobId}/policyEvaluation/{evalId}/override` | `GET`, `POST` | `PolicyOverride` (`policy_override`) | No (`@Include(rootLevel = false)`) | Read: `team view policy override`<br/>Create: `team override policy`<br/>Update/Delete: `user is a super service` |
@@ -271,11 +284,18 @@ When Terrakube dispatches a job, `PolicyResolutionService.resolvePoliciesForJob(
 
 All policy sets are deduplicated by `PolicySet.id` and sorted alphabetically by name.
 
-### Variable Injection (`Category.POLICY`)
-Non-sensitive variables configured with `Category.POLICY` are collected and merged into `PolicyContext.inputs`:
-* Organization-level `Globalvar` (Category `POLICY`, non-sensitive).
-* Workspace-level `Variable` (Category `POLICY`, non-sensitive).
-* Workspace variables override Organization global variables of the same key.
+### Policy Set Parameters (`PolicySetParameter`) & Ingestion
+Parameters are configured directly at the `PolicySet` level (via the Web UI or API) and strictly isolated per policy set during execution:
+* **Storage**: Saved as `PolicySetParameter` records linked to the specific `PolicySet`.
+* **Strict Isolation**: Each policy set receives only its own configured parameters in `PolicyContext.inputs`. Parameters do not leak across policy sets, and ambient organization/workspace variables are not merged.
+* **JSON-Aware Typing**: In runner evaluation (`OpaExecutorServiceImpl.preparePolicyInputsFile`), parameter values are parsed with JSON awareness:
+  * Numbers (e.g. `5` -> integer/float)
+  * Booleans (e.g. `true` / `false`)
+  * JSON Arrays (e.g. `["us-east-1", "us-west-2"]` -> list)
+  * JSON Objects (e.g. `{"timeout": 30, "retries": 3}` -> dictionary)
+  * Plain text strings remain strings.
+* **OPA Injection**: Written to `.terrakube-policies/inputs-{policyId}.json` under `{"terrakube": {"inputs": { ... }}}` and passed via `--data`.
+* **Rego Usage**: Policies access parameters directly through `data.terrakube.inputs.<key>`.
 
 ### Critical Quartz Job Invariant: Avoid Lazy Loading Outside Sessions
 In Terrakube, `ScheduleJob.doRunExecution` intentionally runs without a surrounding Hibernate transaction so individual repository operations commit independently and the Redis distributed lock (`job-execution-lock:<jobId>`) is released cleanly.
