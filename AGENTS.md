@@ -102,3 +102,11 @@
 * Always use non-interactive Jest execution (`yarn test --watchAll=false` or `CI=true yarn test`) when running tests in automated environments.
 * Guidelines: .agents/skills/terrakube-ui/SKILL.md
 
+## 18. Terrakube Terraform Provider (`terraform-provider-terrakube`)
+* The Terraform Provider must be developed in `terraform-provider-terrakube`.
+* Code formatting MUST strictly adhere to `gofmt -s -w .` before committing to satisfy CI `golangci-lint` formatting rules.
+* Documentation in `docs/` is managed via `go generate ./...` (`tfplugindocs`). Any custom documentation must be placed in `templates/` rather than raw markdown files.
+* New API attributes that may not be available on older Terrakube API versions must use pointer types with `json:",omitempty"` to preserve backward compatibility.
+* Guidelines: .agents/skills/terraform-provider-terrakube/SKILL.md
+
+
