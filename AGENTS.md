@@ -109,4 +109,11 @@
 * New API attributes that may not be available on older Terrakube API versions must use pointer types with `json:",omitempty"` to preserve backward compatibility.
 * Guidelines: .agents/skills/terraform-provider-terrakube/SKILL.md
 
-
+## 19. Security & Authorization Invariants
+* All security-critical code across API, Executor, and CLI modules must strictly adhere to the Security Invariants:
+  - Fail closed by default on missing tickets, tokens, or security parameters (never allow missing input to bypass checks).
+  - Contextually scope `TerrakubeInternal` tokens: any token bearing a `workspaceId` claim must strictly match the target workspace and must NEVER be treated as a global superuser or cross-workspace state manager.
+  - Unauthenticated endpoints (e.g., CLI redirects) must be completely stateless with zero DB queries and zero internal UUID exposure.
+  - Child processes launched via `ProcessBuilder` (Terraform, bash) must have sensitive host environment variables (`InternalSecret`, database passwords) stripped before execution.
+  - Temporary credential files (`~/.terraformrc`) must use short-lived tokens with `jti` and be purged in post-execution `finally` blocks.
+  - Guidelines: rules/security-authorization.md
