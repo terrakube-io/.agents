@@ -1,26 +1,32 @@
 ---
 name: terrakube-devcontainer
-description: Connecting to PostgreSQL, inspecting Redis and MinIO, and debugging database and runtime data issues for terrakube-api.platform.local in the local devcontainer environment.
+description: Connecting to PostgreSQL, inspecting Redis and MinIO, and debugging database and runtime data issues for terrakube.localhost / terrakube-api.localhost in the local devcontainer environment.
 ---
 
 # Terrakube Devcontainer & Local Database Debugging Guide
 
-This skill documents how to connect to the PostgreSQL database, inspect service state, and troubleshoot data issues in `terrakube-api.platform.local` within the local Docker Compose / Devcontainer environment (`terrakube/.devcontainer`).
+This skill documents how to connect to the PostgreSQL database, inspect service state, and troubleshoot data issues in Terrakube (UI: `https://terrakube.localhost`, API: `https://terrakube-api.localhost`) within the local Docker Compose / Devcontainer environment (`terrakube/.devcontainer`).
 
 ---
 
 ## 1. Local Environment Architecture & Network Topology
 
-The local development stack runs in Docker under the `terrakube-network` bridge network:
+The local development stack runs in Docker under the `terrakube-network` bridge network. Standard browsers and operating systems automatically resolve `*.localhost` to the loopback address (`127.0.0.1`), eliminating the need for custom `/etc/hosts` or DNS mappings.
 
-| Container / Service | Host Port | In-Network Hostname / Port | Credentials / Notes |
+### Component Endpoints & Network Topology
+
+| Component / Service | Local URL / In-Network Host | Host Port | Credentials / Notes |
 | :--- | :--- | :--- | :--- |
-| **`postgresql-service`** | `5432` | `postgresql-service:5432` | User: `terrakube`, DB: `terrakubedb`, Pass: `terrakubepassword` |
-| **`terrakube-dev`** | — | `terrakube-dev` | Devcontainer workspace (`/workspaces/terrakube`) |
-| **`terrakube-redis`** (Valkey) | Internal | `terrakube-redis:6379` | Auth: `password123456` |
-| **`terrakube-minio`** | `9000`, `9001` | `terrakube-minio:9000` | User: `minioadmin`, Pass: `minioadmin`, Bucket: `sample` |
-| **`terrakube-traefik`** | `80`, `443` | `terrakube-traefik` | Ingress for `terrakube-api.platform.local`, `terrakube.platform.local` |
-| **`dex-service`** | `5556` | `terrakube-dex.platform.local` | OIDC issuer |
+| **Terrakube Web UI** | `https://terrakube.localhost` | `80`, `443` | Sign in: `admin@example.com` / `admin` |
+| **Terrakube API** | `https://terrakube-api.localhost` | `80`, `443` | JSON:API / GraphQL endpoints (`terrakube-api-https:8080`) |
+| **Terrakube Registry** | `https://terrakube-registry.localhost` | `80`, `443` | Module & Provider registry (`terrakube-registry-https:8075`) |
+| **Dex OIDC Issuer** | `https://terrakube-dex.localhost/dex` | `80`, `443` | OIDC IdP for local auth & CLI login (`terrakube-dex-https:5556`) |
+| **Terrakube Executor** | `http://terrakube-executor:8090/api/v1/terraform-rs` | Internal | Container DNS (also routed as `https://terrakube-executor.localhost`) |
+| **`postgresql-service`** | `postgresql-service:5432` | `5432` | User: `terrakube`, DB: `terrakubedb`, Pass: `terrakubepassword` |
+| **`redis-service`** (Valkey) | `terrakube-redis:6379` | Internal | Auth: `password123456` |
+| **`minio`** (Silo) | `terrakube-minio:9000` (API) / `localhost:9001` | `9000`, `9001` | User: `minioadmin`, Pass: `minioadmin`, Bucket: `sample` |
+| **`traefik`** | `terrakube-traefik` | `80`, `443` | Reverse proxy terminating TLS via local `mkcert` certificates |
+| **`terrakube-dev`** | `terrakube-dev` | — | Devcontainer workspace (`/workspaces/terrakube`) |
 
 ---
 

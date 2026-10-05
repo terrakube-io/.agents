@@ -127,5 +127,5 @@ mvn test -Dtest=PlanStructuredOutputServiceTest,ApplyStructuredOutputServiceTest
 ### Validating Context Payload
 Fetch the job context using a Terrakube API token:
 ```bash
-curl -s -H "Authorization: Bearer <TOKEN>" https://terrakube-api.platform.local/context/v1/<JOB_ID> | jq .
+curl -s -H "Authorization: Bearer <TOKEN>" https://terrakube-api.localhost/context/v1/<JOB_ID> | jq .
 ```
