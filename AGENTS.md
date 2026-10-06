@@ -118,3 +118,15 @@
   - Child processes launched via `ProcessBuilder` (Terraform, bash) must have sensitive host environment variables (`InternalSecret`, database passwords) stripped before execution.
   - Temporary credential files (`~/.terraformrc`) must use short-lived tokens with `jti` and be purged in post-execution `finally` blocks.
   - Guidelines: rules/security-authorization.md
+
+## 20. Workspace Dependency Graph & Run Triggers (`io.terrakube.api.rs.workspace.trigger`, `io.terrakube.api.plugin.scheduler.trigger`)
+* Workspaces declare reactive upstream dependencies within an organization using `WorkspaceRunTrigger`.
+* **Structural & Tenant Invariants**: Both source and destination workspaces (and any template override) MUST belong to the same Organization. Self-triggers are strictly forbidden at both application check and DB constraint levels (`chk_run_trigger_no_self`).
+* **Asymmetric RBAC Permissions**:
+  - Creating/updating triggers requires `canManage` on the destination workspace AND `canView` on the source workspace (`TeamManageWorkspaceTrigger`).
+  - Deleting triggers requires `canManage` on the destination workspace ONLY (`TeamDeleteWorkspaceTrigger`).
+  - Source and destination workspace relationship fields are immutable once set (`@UpdatePermission(expression = "user is a superuser")`).
+* **Cycle Prevention**: All new or updated triggers MUST be validated for DAG acyclicity via `WorkspaceGraphValidationService` during Elide `PRECOMMIT`. Both enabled and disabled edges MUST be checked to prevent dormant cycles.
+* **State Change Qualification**: Downstream runs MUST ONLY be dispatched if upstream steps completed a state-changing flow (`terraformApply`, `terraformDestroy`, `customScripts`) and produced a state delta (serial increase or MD5 change). Speculative plans and zero-change applies MUST NOT trigger downstream runs.
+* **Transaction Isolation**: Downstream jobs MUST be persisted in independent transactions using `RunTriggerJobWriter` (`REQUIRES_NEW`) and committed before scheduling Quartz triggers to prevent worker visibility race conditions.
+* Guidelines: .agents/skills/terrakube-run-triggers/SKILL.md

@@ -46,6 +46,9 @@ Executor Execution (runs @Async in executor pod)
        +---> Mark Job "running" via API
        +---> Run Terraform / OpenTofu / Script
        +---> Update step and job status ("pending", "waitingApproval", or "completed")
+       +---> JobReconciliationService.reconcile()
+       |         +---> deleteTriggerAfterCommit() (Cleans Quartz trigger, schedules next FIFO candidate)
+       |         +---> dispatchRunTriggersAfterCommit() (RunTriggerDispatchService.dispatchFor)
        +---> Release ExecutorCapacityGate
        +---> Publish "terrakube:executor-available" to Redis (Doorbell)
        |
@@ -153,5 +156,8 @@ SELECT NOT EXISTS (
 | `ScheduleJobService` | `terrakube/api/.../plugin/scheduler/ScheduleJobService.java` | Manages 30s recurring triggers and ad-hoc one-shot triggers. |
 | `ExecutorAvailabilityListener` | `terrakube/api/.../plugin/scheduler/ExecutorAvailabilityListener.java` | Redis doorbell listener to trigger FIFO head immediately. |
 | `PersistentExecutorService` | `terrakube/api/.../executor/persistent/PersistentExecutorService.java` | REST client to persistent executor with 70s timeout. |
+| `JobReconciliationService` | `terrakube/api/.../reconciliation/JobReconciliationService.java` | Reconciliation to completed, Quartz cleanup, post-commit trigger dispatch. |
 | `JobReconciliationSweep` | `terrakube/api/.../reconciliation/JobReconciliationSweep.java` | Background reconciliation for zero-pending jobs and Quartz triggers. |
+| `RunTriggerDispatchService` | `terrakube/api/.../plugin/scheduler/trigger/RunTriggerDispatchService.java` | Reactive fan-out to downstream dependent workspaces on completed apply. |
+| `RunTriggerJobWriter` | `terrakube/api/.../plugin/scheduler/trigger/RunTriggerJobWriter.java` | Isolated `REQUIRES_NEW` job creation for triggered runs. |
 | `ExecutorJobImpl` | `terrakube/executor/.../executor/ExecutorJobImpl.java` | Executor runner, status callbacks, and doorbell publisher. |
