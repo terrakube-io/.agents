@@ -16,12 +16,13 @@ All development across Terrakube API, Executor, and Client modules MUST strictly
       return true;
   }
   ```
-* Internal tokens are minted for diverse purposes (backend service clients, ephemeral job runners, CLI credentials).
-* **Resource-Scoped Tokens:** If an internal token contains a resource claim (e.g., `workspaceId`, `jobId`):
-  1. It MUST ONLY be authorized for actions targeting that specific resource ID (`token.workspaceId.equals(requestedWorkspaceId)`).
-  2. It MUST NEVER be granted global superuser status, blanket group membership (`isServiceMember`), or access to other workspaces.
-  3. It MUST NEVER pass administrative team checks (e.g. `TeamApproveJob`), VCS secret checks (`ReadAccessToken`), or SSH private key checks (`ReadPrivateKey`).
-* **Service Tokens:** Only system internal tokens *without* resource scoping (or with explicitly verified backend client credentials) may perform cross-tenant system operations.
+* All tokens handled by Terrakube API MUST be classified using `InternalTokenClassifier` into `InternalTokenType`:
+  - `NOT_INTERNAL`: Real user or federated identities. Only these tokens can evaluate user group claims or claim platform administrator/superuser roles.
+  - `WORKSPACE_EXECUTOR`: Ephemeral step-runner tokens (`iss=TerrakubeInternal` with `workspaceId`). Effective groups MUST return an empty set (`[]`), superuser MUST return `false`, and access MUST be strictly constrained to matching entity UUIDs via `ExecutorManageJob`, `ExecutorManageJobStep`, etc.
+  - `EXECUTOR_SERVICE`: Backend Executor service daemon (`sub=TerrakubeInternal (EXECUTOR)`). Zero group membership, zero superuser status. Authorized exclusively via dedicated Elide checks (`IsExecutorService`, `ExecutorManageHistory`).
+  - `REGISTRY_SERVICE`: Backend Registry service daemon (`sub=TerrakubeInternal (REGISTRY)`). Zero group membership, zero superuser status. Authorized exclusively via `IsRegistryService`.
+  - `UNKNOWN_INTERNAL`: Any internal token with unrecognized subject, or legacy `TerrakubeInternal (TOKEN)` without `workspaceId`. Fails closed with zero permissions.
+* **Service Tokens:** Never grant global superuser status to machine tokens. Microservice interactions must be protected by dedicated Elide checks (`IsExecutorService`, `IsRegistryService`).
 
 ## 3. Stateless Public Endpoints & Anti-Harvesting Guardrails
 * Unauthenticated endpoints (such as CLI browser redirect bridges under `/app/*`) MUST be purely stateless forwarders:
@@ -31,12 +32,19 @@ All development across Terrakube API, Executor, and Client modules MUST strictly
 * Error responses for unauthorized or invalid resource resolution in the UI MUST use unified error screens (e.g., HTTP 403 "Not Authorized or resource does not exist") to prevent enumerating valid tenant identifiers.
 
 ## 4. Child Process & Worker Environment Sanitization
-* When spawning external processes (Terraform CLI, OpenTofu, bash scripts, OPA engines) via `ProcessBuilder` or process launchers:
+* When spawning external processes (Terraform CLI, OpenTofu, bash scripts, Groovy runners, OPA engines) via `ProcessBuilder` or process launchers:
   1. Child processes MUST NOT inherit sensitive host environment variables.
-  2. Explicitly sanitize or clear the process environment map before invocation, stripping signing secrets (`InternalSecret`, `secretKey`), database credentials, Redis passwords, and cloud provider root secrets.
-  3. Untrusted job code (Terraform providers, external data sources, custom modules) must never be able to inspect host JVM environment variables or `/proc/$PID/environ`.
+  2. Spawning dynamic scripting engines (Groovy, Bash, Python) MUST execute out-of-process in an isolated child process rather than in-process sandboxers (e.g., AST customizers) which are vulnerable to reflection bypasses in modern Java.
+  3. Explicitly sanitize or clear the process environment map (`clearEnvironment()`) before invocation, passing ONLY an explicit whitelist of safe system variables (`SAFE_SYSTEM_ENV`). Stripping signing secrets (`InternalSecret`, `secretKey`), database credentials, Redis passwords, and cloud provider root secrets is mandatory.
+  4. Never inject administrative Spring beans or service clients (`TerrakubeClient`) into script bindings. All external communication must use short-lived, context-scoped tokens over HTTP.
+  5. Untrusted job code (Terraform providers, external data sources, custom modules, Groovy/Bash scripts) must never be able to inspect host JVM environment variables or `/proc/$PID/environ`.
 
 ## 5. Ephemeral Credential Lifetimes & Guaranteed Teardown
 * Tokens written to disk or container filesystems (such as `~/.terraformrc` credentials) MUST have short expirations strictly matching the job duration (e.g., 60 minutes or `jobTimeout`), NEVER long durations like 30 days.
 * All generated JWTs MUST include a unique `jti` claim to allow immediate revocation in Redis upon job cancellation or completion.
 * Credential files created during workspace setup MUST be scrubbed (overwritten and deleted) inside guaranteed `finally` teardown blocks upon job completion or failure.
+
+## 6. Elide Resource & Field Protection (`@Exclude`)
+* Any JPA `@Entity` field containing executable workflows, templates, or internal state machine data (e.g., `Job.tcl`) MUST be annotated with `@Exclude` to prevent callers from modifying or injecting malicious payloads via Elide JSON:API or GraphQL endpoints.
+* Elide security check expressions MUST use space-separated words without underscores (e.g. `user is an executor service`).
+

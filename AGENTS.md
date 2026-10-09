@@ -113,10 +113,14 @@
 ## 19. Security & Authorization Invariants
 * All security-critical code across API, Executor, and CLI modules must strictly adhere to the Security Invariants:
   - Fail closed by default on missing tickets, tokens, or security parameters (never allow missing input to bypass checks).
-  - Contextually scope `TerrakubeInternal` tokens: any token bearing a `workspaceId` claim must strictly match the target workspace and must NEVER be treated as a global superuser or cross-workspace state manager.
+  - Classify all tokens via `InternalTokenClassifier` (`NOT_INTERNAL`, `WORKSPACE_EXECUTOR`, `EXECUTOR_SERVICE`, `REGISTRY_SERVICE`, `UNKNOWN_INTERNAL`).
+  - Never grant blanket group membership (`isServiceMember` / `isMember`) or superuser status to any internal machine token.
+  - Contextually scope `WORKSPACE_EXECUTOR` tokens: must strictly match target workspace/job/step UUIDs and must NEVER access cross-workspace state, private SSH keys, or VCS tokens.
+  - Partition microservices with dedicated subjects (`EXECUTOR_SERVICE`, `REGISTRY_SERVICE`) and Elide checks (`IsExecutorService`, `IsRegistryService`).
   - Unauthenticated endpoints (e.g., CLI redirects) must be completely stateless with zero DB queries and zero internal UUID exposure.
-  - Child processes launched via `ProcessBuilder` (Terraform, bash) must have sensitive host environment variables (`InternalSecret`, database passwords) stripped before execution.
+  - Spawning dynamic scripts (Groovy, Bash) must execute out-of-process via child JVM/process runners with host secrets (`InternalSecret`, Redis passwords, cloud credentials) stripped.
   - Temporary credential files (`~/.terraformrc`) must use short-lived tokens with `jti` and be purged in post-execution `finally` blocks.
+  - Entity fields containing workflow YAML or execution logic (e.g., `Job.tcl`) must use `@Exclude` to prevent external template injection.
   - Guidelines: rules/security-authorization.md
 
 ## 20. Workspace Dependency Graph & Run Triggers (`io.terrakube.api.rs.workspace.trigger`, `io.terrakube.api.plugin.scheduler.trigger`)
@@ -130,3 +134,20 @@
 * **State Change Qualification**: Downstream runs MUST ONLY be dispatched if upstream steps completed a state-changing flow (`terraformApply`, `terraformDestroy`, `customScripts`) and produced a state delta (serial increase or MD5 change). Speculative plans and zero-change applies MUST NOT trigger downstream runs.
 * **Transaction Isolation**: Downstream jobs MUST be persisted in independent transactions using `RunTriggerJobWriter` (`REQUIRES_NEW`) and committed before scheduling Quartz triggers to prevent worker visibility race conditions.
 * Guidelines: .agents/skills/terrakube-run-triggers/SKILL.md
+
+## 21. Terrakube Templates & Workflow Language (TCL) (`io.terrakube.api.plugin.scheduler.job.tcl`)
+* Workflow templates are defined in YAML (`flow: [...]`) and execute sequential steps (`terraformPlan`, `terraformApply`, `terraformDestroy`, `customScripts`, `approval`).
+* Commands execute using either `GROOVY` (isolated out-of-process JVM) or `BASH` (subshell).
+* Groovy commands execute without ambient host secrets, receiving short-lived scoped JWT tokens and job context variables (`terrakubeApi`, `terrakubeToken`, `jobId`, `stepId`, `workingDirectory`, `terrakubeOutput`).
+* Extensions in `.terrakube/toolsRepository` (e.g., `Context.groovy`) are automatically added to the Groovy classpath and enable sharing structured state and artifacts across steps via `/context/v1/${jobId}`.
+* Cross-command state in Bash is persisted by appending key-value pairs to `$terrakubeEnv`.
+* Guidelines: .agents/skills/terrakube-templates/SKILL.md
+
+## 22. Internal Token Architecture & Microservice Access Controls (`io.terrakube.api.plugin.security.token`)
+* Tokens are classified into 5 discrete tiers (`NOT_INTERNAL`, `WORKSPACE_EXECUTOR`, `EXECUTOR_SERVICE`, `REGISTRY_SERVICE`, `UNKNOWN_INTERNAL`).
+* Internal machine tokens are barred from user group membership and platform superuser status.
+* Microservice permissions for Executor and Registry are partitioned using dedicated Elide checks (`IsExecutorService`, `IsRegistryService`, `ExecutorManageHistory`).
+* Groovy scripts execute out-of-process with scrubbed environments (`GroovyProcessRunner`), neutralizing reflection attacks.
+* Sensitive entity fields are excluded from external Elide manipulation (`@Exclude` on `Job.tcl`).
+* Guidelines: .agents/skills/terrakube-internal-tokens/SKILL.md
+
