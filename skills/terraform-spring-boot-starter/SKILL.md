@@ -55,15 +55,45 @@ mvn install -Dgpg.skip -Dmaven.javadoc.skip=true
 
 ---
 
-## 3. Terraform & OpenTofu Version Resolution (`TerraformDownloader.java`)
+## 3. Terraform & OpenTofu Version Resolution & Binary Caching (`TerraformDownloader.java`)
 
-`TerraformDownloader` provides methods for constraint resolution, binary path generation, and binary downloading:
+### 3.1 Filesystem Directory Layout
+All binaries and archives reside under the user home directory (`~/.terraform-spring-boot/`):
+* **Terraform Archives:** `~/.terraform-spring-boot/download/terraform_<version>_<os>_<arch>.zip`
+* **OpenTofu Archives:** `~/.terraform-spring-boot/download/tofu/tofu_<version>_<os>_<arch>.zip`
+* **Terraform Executable:** `~/.terraform-spring-boot/terraform/<version>/terraform`
+* **OpenTofu Executable:** `~/.terraform-spring-boot/tofu/<version>/tofu`
 
+### 3.2 Binary Download & Caching Lifecycle
+`TerraformDownloader` implements binary-level caching and lazy release resolution:
+
+1. **Exact-Version Binary Check (`findInstalledBinary`):**
+   * If a static semver version (e.g. `1.5.7`, `1.8.2`) is passed, `findInstalledBinary` checks if `~/.terraform-spring-boot/<product>/<version>/<executable>` already exists and is executable (`isUsableBinary`).
+   * If usable, it returns the absolute path **immediately**, making **zero network requests** and bypassing release list fetching.
+2. **Lazy Release List Resolution & Caching (`RELEASES_CACHE`):**
+   * Release lists are not fetched in the constructor; they are requested on-demand when constraint resolution or archive downloads are needed.
+   * Product isolation: resolving Terraform only queries HashiCorp (`index.json`); resolving OpenTofu only queries GitHub Releases API.
+   * Cached in `RELEASES_CACHE` with a 30-minute TTL (`RELEASES_CACHE_TTL = Duration.ofMinutes(30)`) per URL with double-checked locking.
+   * Fallback on failure: on network or rate-limiting (HTTP 403/429) errors during a refresh, previously cached releases are reused for 1 minute (`RELEASES_RETRY_AFTER_FAILURE = Duration.ofMinutes(1)`).
+3. **Archive Reuse & Corrupt Archive Self-Healing:**
+   * If the binary is missing but the `.zip` archive exists in `download/`, extraction is attempted before downloading.
+   * If extraction or download fails, the corrupted zip is deleted via `FileUtils.deleteQuietly(zipFile)` and re-downloaded cleanly.
+
+### 3.3 Core Methods in `TerraformDownloader`
 * **`resolveTerraformVersion(String terraformVersion)`**: Resolves a Terraform version constraint (e.g. `~>1.5`, `>=1.4 <2.0`) to a concrete version string (e.g. `1.5.7`) without downloading binaries.
 * **`resolveTofuVersion(String tofuVersion)`**: Resolves an OpenTofu version constraint to a concrete version string without downloading binaries.
 * **`getTerraformBinaryPath(String resolvedVersion, boolean tofu)`**: Returns the expected local filesystem path where the Terraform (`tofu=false`) or OpenTofu (`tofu=true`) executable will reside after download/extraction.
-* **`downloadTerraformVersion(String terraformVersion)`**: Downloads and extracts the requested Terraform binary if not already cached locally, returning the absolute binary path.
-* **`downloadTofuVersion(String tofuVersion)`**: Downloads and extracts the requested OpenTofu binary if not already cached locally, returning the absolute binary path.
+* **`downloadTerraformVersion(String terraformVersion)`**: Returns the existing binary path if `findInstalledBinary` hits; otherwise resolves version, downloads, unzips, and returns the binary path.
+* **`downloadTofuVersion(String tofuVersion)`**: Returns the existing binary path if `findInstalledBinary` hits; otherwise resolves version, downloads, unzips, and returns the binary path.
+
+### 3.4 Terrakube Executor Binary Cache Flow
+In `terrakube/executor`, the binary lifecycle operates across `TerraformExecutorServiceImpl` and `BinaryCacheRecoveryService`:
+1. **Pre-Resolution:** `TerraformExecutorServiceImpl.resolveTerraformVersion()` calls `resolveTerraformVersion` or `resolveTofuVersion` to normalize constraints (e.g. `>= 1.5.0` -> `1.5.7`) and store the concrete version on `terraformJob`.
+2. **Cloud Storage Restore:** `ensureBinaryCached()` checks local disk or restores the executable binary directly from cloud storage (S3/Azure/GCP via `terraformState.downloadTerraformBinary`) to `~/.terraform-spring-boot/<product>/<version>/<executable>`.
+3. **Cache Hit in Downloader:** When `terraformClient.init()` runs, `downloadTerraformVersion` detects the pre-restored binary via `findInstalledBinary()` and proceeds without downloading or querying release lists.
+4. **Cloud Storage Save:** If the binary was freshly downloaded from upstream, `saveBinaryToCache()` uploads the executable from `getTerraformBinaryPath()` to cloud storage for other pods.
+5. **Execution Concurrency Invariant:** Terrakube enforces 1 job per pod (`ExecutorCapacityGate`), meaning concurrent job file downloads on the same pod do not occur.
+
 
 ---
 
@@ -124,6 +154,7 @@ CompletableFuture<Boolean> jsonSuccess = client.showPlanJson(processData, output
 - [ ] Build under **JDK 21** using `mvn install -Dgpg.skip`.
 - [ ] Ensure Javadoc comments escape `<` and `>` operators using `{@code ...}` tags.
 - [ ] Use `resolveTerraformVersion` / `resolveTofuVersion` when resolving constraints without downloading binaries.
+- [ ] Pre-populate or restore binaries at `~/.terraform-spring-boot/<product>/<version>/<executable>` to hit `findInstalledBinary` zero-network fast path.
 - [ ] Build `TerraformProcessData` with explicit `workingDirectory`, `terraformVersion`, and `tofu` flag.
 - [ ] Pass environment variables via `.terraformEnvironmentVariable(key, value)` and variables via `.terraformVariable(key, value)`.
 - [ ] Always handle `CompletableFuture` response and attach stdout/stderr `outputListener` / `errorListener`.
