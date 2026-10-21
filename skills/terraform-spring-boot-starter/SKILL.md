@@ -1,6 +1,6 @@
 ---
 name: terraform-spring-boot-starter
-description: Guidelines, compilation instructions, Javadoc conventions, Terraform/OpenTofu version resolution, and execution patterns (plan, apply, destroy, variables, environment variables) for `terraform-spring-boot`.
+description: Guidelines, compilation instructions, Javadoc conventions, Terraform/OpenTofu version resolution, execution patterns (plan, apply, destroy, variables, environment variables), and devcontainer live testing workflows for `terraform-spring-boot`.
 ---
 
 # Terraform Spring Boot Starter Development & Operations Guide
@@ -115,6 +115,8 @@ TerraformProcessData processData = TerraformProcessData.builder()
         .terraformVariable("key1", "value1")          // Terraform variable (--var key1=value1)
         .terraformEnvironmentVariable("AWS_ACCESS_KEY_ID", "AKIA...") // Process environment variable
         .terraformEnvironmentVariable("TF_VAR_custom", "custom_val")
+        .pidIsolation(PidIsolation.BEST_EFFORT)       // Linux PID namespace isolation (OFF, BEST_EFFORT, REQUIRED)
+        .cleanEnvironment(true)                       // Sanitize environment, preserving safe allowlist
         .build();
 ```
 
@@ -157,4 +159,78 @@ CompletableFuture<Boolean> jsonSuccess = client.showPlanJson(processData, output
 - [ ] Pre-populate or restore binaries at `~/.terraform-spring-boot/<product>/<version>/<executable>` to hit `findInstalledBinary` zero-network fast path.
 - [ ] Build `TerraformProcessData` with explicit `workingDirectory`, `terraformVersion`, and `tofu` flag.
 - [ ] Pass environment variables via `.terraformEnvironmentVariable(key, value)` and variables via `.terraformVariable(key, value)`.
+- [ ] Configure `pidIsolation` (`PidIsolation.BEST_EFFORT` / `REQUIRED`) and `cleanEnvironment` when hardening against rogue `local-exec` scripts or provider plugins.
 - [ ] Always handle `CompletableFuture` response and attach stdout/stderr `outputListener` / `errorListener`.
+
+---
+
+## 6. Upgrading & Testing in Devcontainer (Live Environment)
+
+When developing features or bug fixes in `terraform-spring-boot`, test them against the running Terrakube live stack inside Docker Compose / Devcontainer (`terrakube_devcontainer-terrakube-dev-1`).
+
+### Step 1: Identify Expected Version in Terrakube Executor
+Check the version declared by `terrakube/executor/pom.xml`:
+```xml
+<terraform-spring-boot-starter.version>1.8.0</terraform-spring-boot-starter.version>
+```
+Ensure you build and install the exact version expected by the consumer branch (e.g. `1.8.0` on `main`, `1.7.0` on release branches).
+
+### Step 2: Build & Install Artifacts with Explicit Revision
+Run `mvn install` with `-Drevision=<VERSION>` using JDK 21:
+```bash
+# Inside the devcontainer:
+docker exec terrakube_devcontainer-terrakube-dev-1 bash -c "cd /workspaces/terraform-spring-boot && mvn install -Drevision=1.8.0 -DskipTests -Dgpg.skip -Dmaven.javadoc.skip=true"
+```
+Or if building on the host:
+```bash
+cd terraform-spring-boot
+JAVA_HOME=/home/user/.sdkman/candidates/java/21.0.9-librca mvn install -Drevision=1.8.0 -DskipTests -Dgpg.skip -Dmaven.javadoc.skip=true
+```
+
+### Step 3: Critical Gotcha — Expand `${revision}` in Installed POMs
+`terraform-spring-boot-starter` and `terraform-spring-boot-autoconfigure` use `<version>${revision}</version>` for internal dependencies. Because installed POMs retain the literal string `${revision}`, consumer builds (`terrakube/executor`) will fail to resolve transitive dependencies unless expanded:
+```bash
+docker exec terrakube_devcontainer-terrakube-dev-1 bash -c "
+  sed -i 's/\${revision}/1.8.0/g' /root/.m2/repository/io/terrakube/terraform/terraform-spring-boot-starter/1.8.0/terraform-spring-boot-starter-1.8.0.pom
+  sed -i 's/\${revision}/1.8.0/g' /root/.m2/repository/io/terrakube/terraform/terraform-spring-boot-autoconfigure/1.8.0/terraform-spring-boot-autoconfigure-1.8.0.pom
+"
+```
+
+### Step 4: Sync Dual `.m2` Directories (`root` & `vscode`)
+The devcontainer maintains two Maven caches:
+- `/root/.m2/repository` (used by `docker exec` commands)
+- `/home/vscode/.m2/repository` (used when launching applications via VS Code debugger as user `vscode`)
+
+Sync artifacts, fix permissions, and delete `_remote.repositories` (so Maven never attempts to overwrite local snapshots with Central releases):
+```bash
+docker exec terrakube_devcontainer-terrakube-dev-1 bash -c "
+  mkdir -p /home/vscode/.m2/repository/io/terrakube/terraform
+  cp -r /root/.m2/repository/io/terrakube/terraform/* /home/vscode/.m2/repository/io/terrakube/terraform/
+  chown -R vscode:vscode /home/vscode/.m2
+  find /home/vscode/.m2/repository/io/terrakube/terraform /root/.m2/repository/io/terrakube/terraform -name '_remote.repositories' -delete
+"
+```
+
+### Step 5: Verify Executor Compilation
+Verify that `terrakube/executor` compiles cleanly against the newly installed library jars:
+```bash
+docker exec terrakube_devcontainer-terrakube-dev-1 bash -c "cd /workspaces/terrakube/executor && mvn test-compile"
+```
+
+### Step 6: Configure Environment Flags in `.envExecutor`
+Update `scripts/setupDevelopmentEnvironment.sh` to configure and export any new executor flags into `.envExecutor`. For example, for PID isolation and clean environment:
+```bash
+IO_TERRAKUBE_TERRAFORM_FLAGS_PID_ISOLATION="best-effort"
+IO_TERRAKUBE_TERRAFORM_FLAGS_CLEAN_ENVIRONMENT="true"
+```
+Re-generate the devcontainer environment configuration:
+```bash
+docker exec terrakube_devcontainer-terrakube-dev-1 bash -c "cd /workspaces/terrakube && ./scripts/setupDevelopmentEnvironment.sh -d POSTGRESQL -s MINIO"
+```
+
+### Step 7: Launch & Validate in Live Stack
+1. In VS Code inside the devcontainer, launch **"Run Executor"** from the Run & Debug view (which injects `${workspaceFolder}/.envExecutor`).
+2. Navigate to the Terrakube UI (`https://terrakube.localhost`), sign in (`admin@example.com` / `admin`), and trigger a workspace run (`Plan` / `Apply`).
+3. Monitor terminal/debug console logs to confirm that the upgraded `terraform-spring-boot` library is active and behaving as expected.
+
+

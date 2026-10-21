@@ -154,3 +154,18 @@ docker compose -f terrakube/.devcontainer/docker-compose.yml rm -f -v postgresql
 docker volume rm devcontainer_postgresql_data
 docker compose -f terrakube/.devcontainer/docker-compose.yml up -d postgresql-service
 ```
+
+---
+
+## 5. Testing Custom `terraform-spring-boot` Library in Devcontainer
+
+To test modifications to the `terraform-spring-boot` library live against the local executor:
+1. Build and install into the container's `.m2` repository with `-Drevision=<version>` matching `terrakube/executor/pom.xml`.
+2. Expand `${revision}` in the installed starter and autoconfigure `.pom` files.
+3. Sync artifacts to `/home/vscode/.m2/repository` with `chown -R vscode:vscode`.
+4. Run `scripts/setupDevelopmentEnvironment.sh` to update `.envExecutor` with any new flags.
+5. Launch **"Run Executor"** via VS Code debugger (`F5`).
+
+For full command sequences, troubleshooting, and gotchas, consult:
+- [.agents/skills/terraform-spring-boot-starter/SKILL.md](file:///home/user/git/terrakube-io/.agents/skills/terraform-spring-boot-starter/SKILL.md#6-upgrading--testing-in-devcontainer-live-environment)
+
