@@ -123,7 +123,140 @@ These variables can be set in the workspace (or global variables) with category 
 
 ---
 
-## 4. Development & Testing Conventions
+## 4. CLI-Driven Workspaces & Custom CA Configuration
+
+### 4.1 Creating a CLI-Driven Workspace via API
+A CLI-driven workspace in Terrakube uses `branch: "remote-content"` and `source: "empty"`.
+
+**Endpoint**: `POST /api/v1/organization/{organizationId}/workspace`
+```json
+{
+  "data": {
+    "type": "workspace",
+    "attributes": {
+      "name": "cli-ephemeral-test",
+      "description": "CLI-driven workspace with ephemeral execution",
+      "executionMode": "remote",
+      "iacType": "terraform",
+      "terraformVersion": "1.5.3",
+      "branch": "remote-content",
+      "source": "empty"
+    }
+  }
+}
+```
+
+### 4.2 Custom CA Root Certificate Mounting
+To enable custom CA certificates in the Ephemeral Executor without modifying the container image:
+1. **Create ConfigMap in target namespace** (e.g. `my-ca-map` in `terrakube`):
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: my-ca-map
+     namespace: terrakube
+   data:
+     type: ca-certificates
+     custom-ca.pem: |
+       -----BEGIN CERTIFICATE-----
+       ...
+       -----END CERTIFICATE-----
+   ```
+2. **Configure Spring Cloud Bindings** via workspace variables.
+
+### 4.3 Essential Ephemeral Workspace Environment Variables
+Attach the following variables to the workspace (`POST /api/v1/organization/{orgId}/workspace/{wsId}/variable`) with `category: "ENV"` and `sensitive: false`:
+
+| Key | Value | Purpose |
+| :--- | :--- | :--- |
+| `TERRAKUBE_ENABLE_EPHEMERAL_EXECUTOR` | `1` | Enables dispatch to Ephemeral Kubernetes Jobs |
+| `EPHEMERAL_CONFIG_MAP_NAME` | `my-ca-map` | ConfigMap volume containing custom CA certificate |
+| `EPHEMERAL_CONFIG_MAP_MOUNT_PATH` | `/mnt/platform/bindings/ca-certificates` | Standard Spring Cloud Bindings certificate directory |
+| `EPHEMERAL_JOB_ENV_VARS` | `SERVICE_BINDING_ROOT=/mnt/platform/bindings;HOME=/tmp` | Enables Spring Cloud Bindings and sets writable `HOME` for non-root user |
+| `EPHEMERAL_CONFIG_ENVFROM_CONFIG_MAP` | `terrakube-executor-config` | Injects cluster connection and storage backend properties |
+| `EPHEMERAL_CONFIG_POD_SECURITY_CONTEXT` | `runAsUser=1000` | Aligns pod execution UID with the `copy-executor-secrets` init container |
+
+---
+
+## 5. End-to-End CLI Testing & Verification Recipe
+
+### Step 1: Acquire Dex Authentication Token
+Dex authenticates against OpenLDAP (default `admin@example.com` / `admin`):
+```python
+import requests, re, urllib.parse, json, os
+
+s = requests.Session()
+s.verify = "/tmp/rootCA.pem"  # Path to CA certificate
+
+# 1. Initiate auth code flow
+r1 = s.get("https://terrakube-api.minikube.net/dex/auth?client_id=example-app&redirect_uri=https://terrakube-ui.minikube.net&response_type=code&scope=openid+email+profile+groups&state=123")
+action = re.search(r'action="([^"]+)"', r1.text).group(1).replace('&amp;', '&')
+login_url = urllib.parse.urljoin("https://terrakube-api.minikube.net", action)
+
+# 2. Submit credentials
+r2 = s.post(login_url, data={"login": "admin@example.com", "password": "admin"}, allow_redirects=False)
+loc = r2.headers.get("Location")
+while "code=" not in loc:
+    r2 = s.get(urllib.parse.urljoin("https://terrakube-api.minikube.net", loc), allow_redirects=False)
+    loc = r2.headers.get("Location")
+code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+
+# 3. Exchange code for JWT id_token
+r3 = s.post("https://terrakube-api.minikube.net/dex/token", data={
+    "grant_type": "authorization_code",
+    "client_id": "example-app",
+    "code": code,
+    "redirect_uri": "https://terrakube-ui.minikube.net"
+})
+id_token = r3.json()["id_token"]
+
+# 4. Save to ~/.terraform.d/credentials.tfrc.json
+os.makedirs(os.path.expanduser("~/.terraform.d"), exist_ok=True)
+with open(os.path.expanduser("~/.terraform.d/credentials.tfrc.json"), "w") as f:
+    json.dump({"credentials": {"terrakube-api.minikube.net": {"token": id_token}}}, f, indent=2)
+```
+
+### Step 2: Prepare Local Terraform Configuration
+Create a test directory with `main.tf`:
+```hcl
+terraform {
+  cloud {
+    hostname     = "terrakube-api.minikube.net"
+    organization = "simple"
+
+    workspaces {
+      name = "cli-ephemeral-test"
+    }
+  }
+}
+
+resource "terraform_data" "greeting" {
+  input = "Hello from Terrakube Ephemeral Executor with Custom CA!"
+}
+
+output "greeting_output" {
+  value = terraform_data.greeting.output
+}
+```
+
+### Step 3: Run Terraform Init & Apply
+```bash
+export SSL_CERT_FILE=/tmp/rootCA.pem
+terraform init
+terraform apply -auto-approve
+```
+
+### Step 4: Verification Checklist
+1. **Init Container**: `kubectl logs <job-pod> -c copy-executor-secrets` exited `0` with `0600` permissions.
+2. **Spring Cloud Bindings**: `kubectl logs <job-pod> -c executor` reports:
+   `Added 1 additional CA certificate(s) to system truststore`
+   `Spring Cloud Bindings Enabled`
+3. **Secret Shredding**: `ExecutorSecretEnvironmentPostProcessor` consumed `/etc/terrakube/secrets/*` and shredded files from memory `emptyDir`.
+4. **Execution Completion**: Pod completes with exit `0`, logs show `Terraform apply Executed Successfully: true`, and the API job status is `completed`.
+
+---
+
+## 6. Development & Testing Conventions
 
 - **Unit Testing**: Test all ephemeral executor logic in `EphemeralExecutorServiceTest.java`.
 - **JDK Requirement**: Use Java 25 (`sdk use java 25.0.2-librca`) when running Maven tests:
