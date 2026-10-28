@@ -151,3 +151,9 @@
 * Sensitive entity fields are excluded from external Elide manipulation (`@Exclude` on `Job.tcl`).
 * Guidelines: .agents/skills/terrakube-internal-tokens/SKILL.md
 
+## 23. Terraform CLI-Driven Workflow & Remote Execution (`/remote/tfe/v2/*`)
+* Terrakube implements the HashiCorp Terraform Cloud / Enterprise Remote Execution protocol.
+* CLI-supplied variables (`-var`, `--var`, `-var-file`) are parsed strictly as HCL literals via `CliRunVariables` and prioritized over workspace variables using `job.variables_as_arguments = true`.
+* Testing remote workflows and troubleshooting ingress, TLS, token auth, and Minikube container caching must follow:
+  - Guidelines: .agents/skills/terrakube-cli-driven-workflow/SKILL.md
+
