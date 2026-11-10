@@ -157,3 +157,10 @@
 * Testing remote workflows and troubleshooting ingress, TLS, token auth, and Minikube container caching must follow:
   - Guidelines: .agents/skills/terrakube-cli-driven-workflow/SKILL.md
 
+## 24. Release Branches & Patch Backports (`release/<major>.<minor>.X`)
+* Maintenance release branches use `.X` notation (e.g., `release/2.34.X`). Semver strings (e.g., `2.34.0`) are immutable release tags.
+* All patch backports must branch from and target `release/<major>.<minor>.X`.
+* Cherry-picks must use `-x` to preserve commit origin traceability.
+* Guidelines: .agents/skills/terrakube-patch-release-backports/SKILL.md
+
+
