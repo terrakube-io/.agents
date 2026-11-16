@@ -26,6 +26,7 @@ When creating or modifying HTTP clients (such as Spring WebFlux `WebClient`, `We
   ```
 
 ## 2. Construction Timing & Immutability
+* **Standardized Reactor Netty Factory (API):** In `terrakube/api`, use `io.terrakube.api.plugin.http.ReactorNettyWebClientFactory` (`connector()`, `redirectingConnector()`, `compressedConnector()`) when creating `WebClient` instances so 30s response / 10s connect timeouts and 32 KiB max response header limits are enforced consistently, paired with Reactor `.timeout(...)` deadlines on blocking calls where needed (e.g., Vault login in `DynamicCredentialsService`).
 * **Immutable Client per Service (Preferred when configuration is static):** If the external endpoint and headers are static for the service (e.g. `PublicRegistryProxyService`), configure and call `.build()` **once in the constructor** and store the resulting immutable `WebClient` in a `private final WebClient webClient` field.
 * **Per-Request Isolation (When configuration is dynamic):** If tokens, headers, or endpoints vary per request or per workspace, use `webClientBuilder.clone()` or set headers per-request on the `RequestHeadersSpec` (`webClient.get().header(...)`).
 

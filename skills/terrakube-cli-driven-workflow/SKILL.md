@@ -18,7 +18,7 @@ Local Terminal                    Terrakube API                  PostgreSQL & St
       |                                 |                                 |                                  |
  1.   |--- GET /remote/tfe/v2/ping ---->|                                 |                                  |
  2.   |--- GET /remote/tfe/v2/workspaces/:org/:ws ----------------------->|                                  |
- 3.   |--- POST /.../configuration-versions (auto-create: true) --------->|                                  |
+ 3.   |--- POST /.../configuration-versions (speculative, auto-queue-runs) -->|                                  |
  4.   |--- PUT <upload-url> (packages & uploads project .tar.gz) -------->| (MinIO / S3 storage)             |
  5.   |--- POST /remote/tfe/v2/runs (data.attributes.variables) -------->|                                  |
       |       [Parses HCL literals via CliRunVariables]                   |                                  |
@@ -26,7 +26,7 @@ Local Terminal                    Terrakube API                  PostgreSQL & St
       |                                 |--- INSERT Job ----------------->|                                  |
  6.   |                                 |--- Dispatch Step (Quartz/Redis) ---------------------------------->|
       |                                 |                                 |     Writes terrakube-run-variables.tfvars (0600)
-      |                                 |                                 |     Runs: terraform plan --var ...
+      |                                 |                                 |     Runs: terraform plan --var ... (-var-file for non-string HCL)
  7.   |<-- Streams logs via WebSocket / SSE / Polling -------------------------------------------------------|
 ```
 
@@ -34,7 +34,8 @@ Local Terminal                    Terrakube API                  PostgreSQL & St
 - **`RemoteTfeService`**: Handles workspace lookup, configuration version creation, and run creation (`POST /remote/tfe/v2/runs`).
 - **`CliRunVariables`**: Parses and validates CLI parameters as HCL literals (strings, heredocs, numbers, booleans, tuples, objects, null), rejecting expressions and interpolations upfront with HTTP 400.
 - **`Job.variablesAsArguments`**: Boolean flag marking that the job received CLI parameters that must override workspace/template defaults.
-- **`RunVariablesFile` (Executor)**: Serializes complex HCL literals into `terrakube-run-variables.tfvars` with strict `0600` permissions and cleans it up in post-execution `finally` blocks.
+- **`RunVariablesFile` (Executor)**: Passes string literals as `--var name=value` arguments and serializes non-string HCL literals into `terrakube-run-variables.tfvars` (`0600`, cleaned in `finally`), attached via `-var-file` on `plan`, `destroy`, and un-planned `apply`.
+- **HTTP State Backend (`HttpTerraformStateImpl`)**: When enabled, configures `TF_HTTP_USERNAME` / `TF_HTTP_PASSWORD` (token TTL tied to `ExecutorJobMaxDurationMinutes`, default 360 min) and omits `-backend-config` init arguments via `BackendConfigArguments.strip`. Binary caching uses `tfbinary/{product}/{version}/{os}_{arch}/{product}`, and resolved OpenTofu versions strip leading `v` prefixes.
 
 ---
 
@@ -45,7 +46,7 @@ Terraform CLI reads API tokens from `~/.terraform.d/credentials.tfrc.json`:
 ```json
 {
   "credentials": {
-    "terrakube-api.minikube.net": {
+    "terrakube-api.localhost": {
       "token": "<JWT_OR_PAT_TOKEN>"
     }
   }
@@ -53,38 +54,50 @@ Terraform CLI reads API tokens from `~/.terraform.d/credentials.tfrc.json`:
 ```
 
 #### Generating a Dev Token via Dex / Python
-In Minikube or dev environments with Dex:
+In local devcontainer (`terrakube-dex.localhost`) or Kubernetes/Minikube environments with Dex:
 ```python
-import requests, json
+import json, os, re, requests, urllib.parse
 
-dex_url = "https://terrakube-dex.minikube.net/dex/token"
-# Exchange credentials for token
-resp = requests.post(dex_url, verify=False, data={
-    "grant_type": "password",
-    "username": "admin@example.com",
-    "password": "password",
-    "scope": "openid profile email groups",
-    "client_id": "terrakube-client",
-    "client_secret": "terrakube-secret"
+API_URL = os.environ.get("TERRAKUBE_API_URL", "https://terrakube-api.localhost")
+UI_URL = os.environ.get("TERRAKUBE_UI_URL", "https://terrakube.localhost")
+API_HOST = urllib.parse.urlparse(API_URL).hostname
+
+s = requests.Session()
+s.verify = os.environ.get("SSL_CERT_FILE", True)
+
+# Authorization code flow against Dex / OpenLDAP (default devcontainer: admin@example.com / admin)
+r1 = s.get(f"{API_URL}/dex/auth?client_id=example-app&redirect_uri={UI_URL}&response_type=code&scope=openid+email+profile+groups&state=123")
+action = re.search(r'action="([^"]+)"', r1.text).group(1).replace("&amp;", "&")
+r2 = s.post(urllib.parse.urljoin(API_URL, action), data={"login": "admin@example.com", "password": "admin"}, allow_redirects=False)
+loc = r2.headers.get("Location")
+while "code=" not in loc:
+    r2 = s.get(urllib.parse.urljoin(API_URL, loc), allow_redirects=False)
+    loc = r2.headers.get("Location")
+code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+
+r3 = s.post(f"{API_URL}/dex/token", data={
+    "grant_type": "authorization_code",
+    "client_id": "example-app",
+    "code": code,
+    "redirect_uri": UI_URL,
 })
-token = resp.json()["id_token"]
+token = r3.json()["id_token"]
 
-with open("/home/user/.terraform.d/credentials.tfrc.json", "w") as f:
-    json.dump({"credentials": {"terrakube-api.minikube.net": {"token": token}}}, f, indent=2)
+os.makedirs(os.path.expanduser("~/.terraform.d"), exist_ok=True)
+with open(os.path.expanduser("~/.terraform.d/credentials.tfrc.json"), "w") as f:
+    json.dump({"credentials": {API_HOST: {"token": token}}}, f, indent=2)
 ```
 
 ### 2.2 TLS / Custom CA Certificates
-If testing against Minikube or an environment using a private CA:
+If testing against a local or Minikube environment using a private CA:
 ```bash
 # Export path to root CA so Terraform CLI can verify the API ingress certificate:
-export SSL_CERT_FILE=/tmp/rootCA.pem
+export SSL_CERT_FILE=/path/to/rootCA.pem
 ```
 
 ### 2.3 DNS / Host Resolution
-Ensure `/etc/hosts` contains entries resolving your ingress hostnames to the Minikube IP:
-```
-192.168.49.2  terrakube-api.minikube.net terrakube-dex.minikube.net
-```
+* **Devcontainer (`*.localhost`)**: `terrakube-api.localhost` and `terrakube-dex.localhost` resolve to `127.0.0.1` automatically without `/etc/hosts` changes.
+* **Custom Cluster / Minikube**: Ensure `/etc/hosts` maps your ingress hostnames (e.g. `terrakube-api.minikube.net`) to the cluster IP.
 
 ---
 
@@ -94,7 +107,7 @@ Ensure `/etc/hosts` contains entries resolving your ingress hostnames to the Min
 ```hcl
 terraform {
   cloud {
-    hostname     = "terrakube-api.minikube.net"
+    hostname     = "terrakube-api.localhost" # Or your cluster's API hostname
     organization = "simple"
 
     workspaces {
@@ -228,13 +241,13 @@ kubectl -n terrakube logs deployment/terrakube-api | grep -i "ChangeSet db/chang
 
 | Symptom | Probable Cause | Diagnostic / Resolution Steps |
 | :--- | :--- | :--- |
-| **`x509: certificate signed by unknown authority`** | Custom or self-signed CA on Minikube ingress | Export root certificate: `export SSL_CERT_FILE=/tmp/rootCA.pem`. Verify with `curl -v --cacert /tmp/rootCA.pem https://terrakube-api.minikube.net/remote/tfe/v2/ping`. |
+| **`x509: certificate signed by unknown authority`** | Custom or self-signed CA on local/cluster ingress | Export root certificate: `export SSL_CERT_FILE=/path/to/rootCA.pem`. Verify with `curl -v --cacert /path/to/rootCA.pem https://<api-host>/remote/tfe/v2/ping`. |
 | **`Error: 401 Unauthorized`** | Missing or expired token in `credentials.tfrc.json` | Verify `~/.terraform.d/credentials.tfrc.json` contains token under exact hostname. Inspect token claims: `echo $TOKEN \| jq -R 'split(".") \| .[1] \| @base64d \| fromjson'`. Verify expiry (`exp`). |
 | **`Error: Workspace not found`** | Case sensitivity or workspace does not exist | Check workspace existence via API or UI. Check workspace execution mode is `remote` (if `local`, CLI fails or runs locally). |
 | **`Error: No value for required variable`** (despite passing `-var`) | API discarding `data.attributes.variables` or running outdated image | 1. Check API pod image: `kubectl -n terrakube get deployment terrakube-api -o jsonpath='{.spec.template.spec.containers[0].image}'`.<br>2. Check `job` table in PostgreSQL: `SELECT id, status, variables_as_arguments FROM job ORDER BY id DESC LIMIT 5;`.<br>3. Verify `variables_as_arguments` is `true`. |
 | **HTTP 400 Bad Request on `terraform plan`** | Dynamic expression or invalid HCL passed in CLI variable | `CliRunVariables` enforces HCL literal syntax. Passing expressions like `-var 'foo=${var.bar}'` or unquoted complex structures triggers validation failure. Ensure literals are valid HCL syntax. |
 | **CLI hangs on `Preparing the remote plan...`** | Configuration upload failure or Redis lock blocking FIFO queue | 1. Check MinIO / storage access.<br>2. Check Redis lock: `docker exec -it redis-service redis-cli keys "job-execution-lock:*"`.<br>3. Check API logs for scheduler dispatch exceptions: `kubectl -n terrakube logs deployment/terrakube-api --tail=200`. |
-| **Executor Job Pod fails or restarts** | Custom CA missing in executor pod or permission errors | 1. Check executor pod logs: `kubectl -n terrakube logs -l app.kubernetes.io/name=executor`.<br>2. If using Ephemeral Executor, check init container: `kubectl -n terrakube logs <job-pod> -c copy-executor-secrets`. File permissions must be `0600`. |
+| **Executor Job Pod fails or restarts** | Custom CA missing in executor pod or permission errors | 1. Check executor pod logs: `kubectl -n terrakube logs -l app.kubernetes.io/name=executor`.<br>2. If using Ephemeral Executor, check init container: `kubectl -n terrakube logs <job-pod> -c copy-executor-secrets`. |
 
 ---
 

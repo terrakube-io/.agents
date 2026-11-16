@@ -35,8 +35,10 @@ flow:
 | `terraformPlanDestroy` | Generates a speculative destroy plan (CLI-driven). | Yes (`before`, `after`, `beforeInit`) |
 | `customScripts` | Standalone script step without running Terraform commands. | Yes (runs all listed commands) |
 | `approval` | Pauses execution and waits for team approval. | Evaluates `team:` field; rejects run `onReject` |
+| `policyEvaluation` | Evaluates OPA policies on the generated plan. | No |
 | `disableWorkspace` | Marks workspace as disabled/deleted. | No |
 | `scheduleTemplates` | Dynamically triggers sub-templates. | Evaluates `templates:` field |
+| `yamlError` | Internal sentinel when TCL YAML parsing fails. | No |
 
 ### Flow Step Fields
 
@@ -45,6 +47,10 @@ flow:
 * `step` (required): Integer step sequence number (e.g., `100`, `150`, `200`).
 * `team` (optional): Team name required for manual approval (used when `type: "approval"`).
 * `ignoreError` (optional, boolean): If `true`, a failure in this step will not abort subsequent steps.
+* `requireSavedPlan` (optional, boolean): On `terraformApply`, requires the saved plan artifact (`terraformLibrary.tfPlan`) to exist and be non-empty, failing before apply even if `ignoreError: true` and applying without injecting workspace Terraform variables.
+* `artifacts` (optional): Artifact glob patterns saved/restored across steps.
+* `inputsEnv` / `inputsTerraform` (optional, boolean): Controls whether workspace environment or Terraform variables are injected for the step.
+* `importCommands` (optional): Imports reusable command sets (`ImportCommands`).
 * `commands` (optional): List of command objects to execute.
 * `onFailure` (optional): List of command objects executed if this step fails.
 * `onReject` (optional): List of command objects executed if an approval is rejected.
@@ -89,6 +95,7 @@ Terrakube automatically populates the process environment and script bindings fo
 | `terrakubeEnv` | String | Path to `.terrakube_temp_env` file used to persist variables between commands. |
 | `terrakubeApi` | String | Base URL of the Terrakube API (e.g. `https://terrakube-api.localhost`). |
 | `terrakubeToken` | String | Short-lived scoped JWT bearer token (scoped to `organizationId`, `workspaceId`, `jobId`, `stepId`). |
+| `accessToken` | String | VCS OAuth/installation access token when available for the workspace repository. |
 | `organizationId` | String | UUID of the organization. |
 | `workspaceId` | String | UUID of the workspace. |
 | `jobId` | String | Identifier of the current Job. |
@@ -98,7 +105,7 @@ Terrakube automatically populates the process environment and script bindings fo
 | `branch` | String | Target Git branch. |
 | `vcsType` | String | VCS provider type (e.g. `GITHUB`, `GITLAB`, `PUBLIC`). |
 | `terraformOutput` | String | Stdout text captured from `terraform plan` or `terraform apply`. |
-| `terraformOutputJson` | String | JSON-formatted output captured from Terraform operations. |
+| `terraformOutputJson` | String | *(Groovy only)* JSON-formatted output captured from Terraform operations. |
 | `terrakubeOutput` | PrintStream | *(Groovy only)* Output stream mapped to the UI execution logs (`System.out`). |
 
 In addition, any workspace environment variables and Terraform variables (`TF_VAR_...`) configured in the workspace are loaded into the environment.
@@ -110,20 +117,21 @@ In addition, any workspace environment variables and Terraform variables (`TF_VA
 ### 1. Step Dispatch & Tool Provisioning (`ScriptEngineService`)
 When `ExecutorJobImpl` processes a step containing script commands:
 1. `ScriptEngineService.execute(...)` is invoked.
-2. `createToolsDirectory()` clones the configured extensions repository (`org.terrakube.tools.repository`, default `https://github.com/AzBuilder/terrakube-extensions`) into `$workingDirectory/.terrakube/toolsRepository`.
-3. Commands are sorted in ascending order by `priority` and dispatched to either `GroovyEngine` or `BashEngine`.
-4. When execution finishes, `cleanToolsDirectory()` purges the cloned extensions directory.
+2. `createToolsDirectory()` clones the configured extensions repository (`io.terrakube.tools.repository` and `io.terrakube.tools.branch`, populated from `${TerrakubeToolsRepository}`) into `$workingDirectory/.terrakube/toolsRepository`.
+3. Commands are inserted into a `TreeMap<Integer, Command>` keyed by `priority` (ascending order; duplicate priorities overwrite earlier commands) and dispatched to either `GroovyEngine` or `BashEngine`.
+4. When execution finishes in the `try` block, `cleanToolsDirectory()` purges the cloned extensions directory.
 
 ### 2. Process Orchestration (`ProcessLauncher`)
 Both engines rely on `ProcessLauncher` to execute commands as separate OS processes:
-* Spawns OS processes using `java.lang.ProcessBuilder`.
+* Spawns OS processes using `java.lang.ProcessBuilder`, applying Linux PID namespace isolation (`unshare --map-root-user --user --pid --fork --mount-proc`) when available.
+* Clears ambient host environment variables via `processLauncher.clearEnvironment()`.
 * Uses `Executors.newWorkStealingPool()` to launch two asynchronous consumer threads that continuously drain `stdout` and `stderr`. This prevents OS pipe buffer deadlocks when scripts produce large volumes of output.
 * Bridges output back to Terrakube logs via `Consumer<String>` listeners.
 * Waits for completion via `CompletableFuture<Integer>` and checks process exit codes.
 
 ### 3. Groovy Execution Flow (`GroovyEngine` & `GroovyProcessRunner`)
 1. **Script Serialization**: Writes the command script to `$workingDirectory/userScript.groovy`.
-2. **Process Spawn**: Launches a separate, dedicated child JVM using the active container JRE (`$JAVA_HOME/bin/java -cp <classpath> GroovyProcessRunner <scriptPath> <toolsRepoPath>`).
+2. **Process Spawn**: Launches a separate, dedicated child JVM (using `org.apache.groovy:groovy-all` `6.0.0`, supporting both standard classpath and fat-JAR `PropertiesLauncher` layouts) with `$JAVA_HOME/bin/java -cp <classpath> GroovyProcessRunner <scriptPath> <toolsRepoPath>`.
 3. **Environment Sanitization**: Calls `processLauncher.clearEnvironment()` to strip ambient host secrets. Only whitelisted safe system variables (`SAFE_SYSTEM_ENV`) plus explicit job parameters are injected.
 4. **Classpath Scanning (`GroovyProcessRunner`)**:
    * Scans `$workingDirectory/.terrakube/toolsRepository` for all `.groovy` files.
@@ -133,16 +141,17 @@ Both engines rely on `ProcessLauncher` to execute commands as separate OS proces
 6. **Execution**: `engine.run(scriptFile.getName(), sharedData)` executes the script out-of-process.
 
 ### 4. Bash Execution Flow (`BashEngine`)
-1. Writes the script to `$workingDirectory/userScript.sh` and marks it executable (`setExecutable(true)`).
-2. Spawns `/bin/bash` with working directory set to `$workingDirectory`.
-3. Automatically prepends `$bashToolsDirectory` (`.terrakube/tools`) to `$PATH`.
-4. Sources and injects variables defined in `$workingDirectory/.terrakube_temp_env`.
+1. Writes the script to `$workingDirectory/userScript.sh` (marking `.sh` files under `toolsRepository` and `workingDirectory` executable via `loadingBashTools`).
+2. Calls `processLauncher.clearEnvironment()` and whitelists `SAFE_SYSTEM_ENV` + scoped job context variables.
+3. Spawns `bash` (`"bash", bashScript.getAbsolutePath()`) with working directory set to `$workingDirectory`.
+4. Automatically prepends `$bashToolsDirectory` (`.terrakube/tools`) to `$PATH`.
+5. Sources and injects variables defined in `$workingDirectory/.terrakube_temp_env`.
 
 ---
 
-## 5. Security Best Practices & Invariants (TK-01 Hardening)
+## 5. Security Best Practices & Invariants
 
-Remediation of **TK-01** (GHSA-93xj-45jp-99rq) established strict architectural invariants to prevent untrusted templates from escalating privileges or leaking platform secrets:
+Terrakube enforces strict architectural invariants so untrusted templates cannot escalate privileges or leak platform secrets:
 
 ### Invariant 1: Out-of-Process Isolation Over In-Process Sandboxing
 * **The Vulnerability**: Historically, script engines relied on in-process compilation customizers (like Groovy's `SecureASTCustomizer`). In modern Java (Java 21+), `SecurityManager` has been permanently removed. AST customizers can restrict explicit syntax (e.g. `System.exit()`), but attackers easily bypass them via dynamic reflection:
@@ -179,7 +188,7 @@ Remediation of **TK-01** (GHSA-93xj-45jp-99rq) established strict architectural 
 ### Invariant 5: Guaranteed Filesystem & Workspace Teardown
 * Scripts and temporary tools must be purged immediately after execution:
   * Ephemeral scripts (`userScript.groovy`, `userScript.sh`) and `.terrakube_temp_env` must reside only within the isolated working directory.
-  * The tools repository (`.terrakube/toolsRepository`) must be deleted in a `finally` block via `cleanToolsDirectory()`.
+  * The tools repository (`.terrakube/toolsRepository`) is purged via `cleanToolsDirectory()` when `ScriptEngineService.execute()` finishes (ensure cleanup runs reliably even across error paths).
   * Temporary credential files (e.g. `~/.terraformrc`) must be wiped after each step.
 
 ---

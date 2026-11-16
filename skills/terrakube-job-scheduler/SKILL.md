@@ -18,13 +18,13 @@ Terrakube coordinates asynchronous job execution across `terrakube-api`, Postgre
 ```mermaid
 flowchart TD
     subgraph JobCreation ["1. Creation & Scheduling"]
-        User["User / Webhook / CLI\n(POST /api/v1/job)"] --> Hook["JobManageHook\n(Elide PRECOMMIT / POSTCOMMIT)"]
+        User["User / Webhook / CLI\n(POST /api/v1/job)"] --> Hook["JobManageHook\n(Elide POSTCOMMIT)"]
         Hook --> Svc["ScheduleJobService.createJobContext\n(Creates 30s Quartz trigger: TerrakubeV2_Job_<jobId>)"]
         Svc --> Quartz["Quartz Scheduler\n(Fires ScheduleJob.execute)"]
     end
 
     subgraph AdmissionAndLocking ["2. Locking & Two-Tier Admission"]
-        Quartz --> LockAcq{"Acquire Redis Lock\n(job-execution-lock:<jobId>, TTL 90s)"}
+        Quartz --> LockAcq{"Acquire Redis ExecutionLease\n(job-execution-lock:<jobId>, TTL 90s, renewed every 30s)"}
         LockAcq -->|Failed / Contended| SkipTick["Skip Tick (Retry in 30s)"]
         LockAcq -->|Acquired| WsLock{"Workspace Locked?\n(workspace.isLocked && !isOwnPrApplyLock)"}
         WsLock -->|Yes| SkipWsLock["Skip Tick & Emit Gauge\n(countJobsHeldByLockedWorkspace)"]
@@ -42,21 +42,21 @@ flowchart TD
     end
 
     subgraph DispatchExecution ["4. Dispatch & Execution"]
-        QueryA -->|Oldest / Next Eligible| DispatchStep["dispatchStepOrDefer()\n(Acquire VCS token, render step inputs)"]
+        QueryA -->|Oldest / Next Eligible| DispatchStep["dispatchStepOrDefer()\n(Acquire VCS token, DynamicCredentials, render inputs)"]
         QueryB -->|Oldest / Next Eligible| DispatchStep
         QueryC -->|Oldest / Next Eligible| DispatchStep
 
         DispatchStep -->|VCS Failure & Attempts < 8| Backoff["DispatchRetryCalculator\n(Exponential backoff: 15s -> 900s\nSets dispatch_next_retry_at)"]
-        DispatchStep -->|Success| SendExec["ExecutorService.sendJob\n(POST /api/v1/terraform-rs or K8s Job)"]
+        DispatchStep -->|Success| SendExec["ExecutorService.sendClaimed\n(Claim step in Redis, POST /api/v1/terraform-rs or K8s Job)"]
         SendExec -->|202 Accepted| MarkQueue["Mark Job Status -> 'queue'"]
-        MarkQueue --> WakeFIFO["wakeNextDispatchableJob()\n(Wakes next eligible FIFO candidate)"]
-        WakeFIFO --> RelLock["Release Redis Lock\n(DEL job-execution-lock:<jobId>)"]
+        MarkQueue --> WakeFIFO["wakeQueueHead()\n(Wakes next eligible FIFO candidate)"]
+        WakeFIFO --> RelLock["Release ExecutionLease in finally\n(Token-checked Lua DEL)"]
     end
 
     subgraph RuntimeLifecycle ["5. Runtime Execution & Doorbell"]
         SendExec -.-> ExecPod["terrakube-executor Pod\n(Runs @Async job worker)"]
         ExecPod --> ExecRunning["Mark Job 'running' via API"]
-        ExecPod --> Heartbeat["Publish Heartbeat periodically\n(SET executor-job-heartbeat:<jobId>, TTL 30s)"]
+        ExecPod --> Heartbeat["Publish Heartbeat every 15s\n(SET executor-job-heartbeat:<jobId>, TTL 45s)"]
         ExecPod --> ExecDone["Complete Terraform execution\n(Update step & job status)"]
         ExecDone --> RelGate["Release ExecutorCapacityGate"]
         RelGate --> Doorbell["Publish Redis Doorbell\n(PUBLISH terrakube:executor-available)"]
@@ -80,23 +80,19 @@ flowchart TD
 ### The Problem
 In Quartz Scheduler, `@DisallowConcurrentExecution` on `ScheduleJob` only prevents concurrent executions of the **same** `JobDetail` key. Because Terrakube frequently spawns ad-hoc one-shot triggers via `ScheduleJobService.createJobContextNow` (which creates dynamically suffixed keys `TerrakubeV2_Job_<jobId>_<uuid>`), Quartz would otherwise run recurring ticks and event-driven triggers concurrently across multiple API replicas for the same job.
 
-### Lock Specification & Invariants
-* **Unified Lock Key**: `job-execution-lock:<jobId>`
-* **TTL**: `90 seconds` (`Duration.ofSeconds(90)`), comfortably exceeding the 70s worst-case HTTP connect (10s) and read (60s) timeouts of `PersistentExecutorService`.
-* **Shared Protection**: The lock is shared across all components that process or mutate jobs:
-  1. `ScheduleJob` (dispatch and state evaluation)
-  2. `InactiveJobs` (stalled job termination)
-  3. `JobReconciliationSweep` (heartbeat and trigger remediation)
-* **Atomic Acquisition**:
-  ```java
-  Boolean acquired = redisTemplate.opsForValue()
-          .setIfAbsent(EXECUTION_LOCK_PREFIX + jobId, "1", EXECUTION_LOCK_TTL);
-  ```
+### Lock Specification & Invariants (`ExecutionLease`)
+* **Unified Lock Key & Ownership Token**: `ExecutionLease` (`io.terrakube.api.plugin.scheduler.ExecutionLease`) + `ExecutionLeaseContext` manage `job-execution-lock:<jobId>` using a per-hold UUID token (`SET ... NX PX`) and atomic Lua scripts (`RELEASE_SCRIPT`, `renewScript`, `claimScript`, `UNCLAIM_SCRIPT`).
+* **TTL & Automatic Renewal**: `90 seconds` (`Duration.ofSeconds(90)`). `ScheduleJob.withExecutionLock()` holds the lease across `doRunExecution()` and renews it every `30 seconds` (`EXECUTION_LOCK_RENEW_INTERVAL`) on a scheduled executor (`LOCK_RENEWAL`), cancelling renewal and releasing via token-checked Lua in `finally` (never deleting a lock whose ownership already expired or moved to another worker).
+* **Step Dispatch Claiming (`job-dispatch-claim:<jobId>:<stepId>`)**: Before `ExecutorService.sendClaimed()` submits to an executor, `lease.claimDispatch(stepId)` atomically writes a 5-minute claim (`DISPATCH_CLAIM_TTL`) only if the worker still owns the execution lock. If ownership was lost, `DispatchNotClaimedException` is thrown so the scheduler retains the trigger and retries; `lease.releaseDispatchClaim(stepId)` runs only on `ExecutorUnavailableException`.
+* **Shared Protection**: The lease is shared across all components that process or mutate jobs:
+  1. `ScheduleJob` (dispatch and state evaluation via `withExecutionLock`)
+  2. `InactiveJobs` (stalled job termination via `ExecutionLease.acquire(..., Duration.ofSeconds(90), Duration.ZERO)`)
+  3. `JobReconciliationSweep` (heartbeat and trigger remediation via `ExecutionLease.acquire(..., Duration.ofSeconds(90), Duration.ZERO)`)
 * **Release Timing**:
-  - The lock is released **immediately** in the `finally` block once the executor acknowledges dispatch with HTTP `202 Accepted`.
+  - The lease is released in `finally` once `doRunExecution()` completes (immediately after HTTP `202 Accepted` or K8s Job submission).
   - **CRITICAL**: The lock is **NEVER** held during the long-running execution of Terraform.
 * **Fail-Closed Safety**:
-  - If Redis is unreachable, lock acquisition catches `DataAccessException` and returns `false`.
+  - If Redis is unreachable, `ExecutionLease` acquisition catches `DataAccessException` and returns empty/unacquired.
   - The execution skips the current tick and retries on the next 30s cycle, preventing unprotected parallel execution.
 
 ---
@@ -116,10 +112,9 @@ Within a single workspace, only one state-modifying job may execute at a time:
   - If a workspace is locked, `ScheduleJob` skips execution unless the job is the specific run that owns the PR comment lock (`isOwnPrApplyLock(job)`).
   - Skips are tracked via the `countJobsHeldByLockedWorkspace()` gauge (`terrakube.scheduler.executor.queue.locked.skipped`) without holding up the global FIFO queue for other workspaces.
 
-### Tier 2: Executor Capacity Gating
-* Persistent executor pods enforce single-tenant concurrency via `ExecutorCapacityGate`.
-* When busy, an executor sets its readiness probe to `REFUSING_TRAFFIC` and returns `503 SERVICE_UNAVAILABLE`.
-* The API's `PersistentExecutorService` catches the 503 or connection timeout as an `ExecutorUnavailableException`. The scheduler leaves the job in `pending`/`approved` to retry later without failing the run.
+### Tier 2: Executor Capacity Gating & Pre-Dispatch Checks
+* **Persistent Executor Capacity & SSRF**: Persistent executor pods enforce single-tenant concurrency via `ExecutorCapacityGate`. When busy, an executor sets its readiness probe to `REFUSING_TRAFFIC` and returns `503 SERVICE_UNAVAILABLE`. `PersistentExecutorService.getExecutorUrl()` validates workspace/org-configured executor URLs (`workspace.getAgent().getUrl()`, `TERRAKUBE_DEFAULT_EXECUTOR`) via `AgentUrlValidator` (`io.terrakube.agent.ssrf.blockPrivateNetworks=true`), while exempting the operator-configured fallback `io.terrakube.executor.url`.
+* **Dynamic Credentials & Bounded Vault Login**: `ExecutorService.loadOtherEnvironmentVariables()` invokes `DynamicCredentialsService` (including `DynamicCredentialsService.runPhase(job, flow)` when `io.terrakube.dynamic.credentials.run-phase.enabled` is active to separate plan vs apply identities via `TERRAKUBE_RUN_PHASE` / `TF_VAR_terrakube_run_phase`). `DynamicCredentialsService.loginToVault()` uses `WebClient` with `ReactorNettyWebClientFactory.connector(...)`, bounded by `3s` connect timeout, `10s` read timeout, `20s` Reactor `.timeout()` deadline, and `VAULT_MAX_ATTEMPTS = 2`; failures throw `DynamicCredentialsException` -> `ExecutionException` (failing the job immediately rather than entering dispatch retry).
 
 ---
 
@@ -240,9 +235,9 @@ To prevent orphaned or crashed runs from lingering forever in non-terminal state
 * If an active job has no Quartz trigger (e.g. due to an API crash between trigger deletion and DB commit), re-creates the trigger immediately.
 
 ### 2. Executor Heartbeat Expiration
-* Executors maintain a periodic heartbeat key in Redis: `executor-job-heartbeat:<jobId>` with a 30-second TTL.
+* Executors maintain a periodic heartbeat key in Redis via `JobExecutionWatchdog`: `executor-job-heartbeat:<jobId>` with a **`45`-second TTL** (refreshed every `15` seconds).
 * If a job is in `queue` or `running` and its heartbeat key is missing:
-  - Honors `REDIS_WARMUP_PERIOD = 90s` after API/Redis startup to prevent premature termination during cold starts.
+  - Honors `REDIS_WARMUP_PERIOD = 90s` after API/Redis startup and `io.terrakube.scheduler.reconciliation.heartbeat-grace-period-seconds` (`300s` default) to prevent premature termination during cold starts or dispatch handoffs.
   - Marks the job as `failed` with message: `Executor heartbeat expired: executor lost or crashed`.
 
 ### 3. Zero-Pending Step Resolution
@@ -254,35 +249,37 @@ To prevent orphaned or crashed runs from lingering forever in non-terminal state
 
 ### 4. Structured Output Spool Recovery (`SpoolRecoveryService`)
 * If an executor is temporarily unable to reach the API to patch context data, it spools structured output and logs to cloud storage (`StorageTypeService`).
-* `SpoolRecoveryService` sweeps pending spool records, applies patches to the database context via `contextWriteService`, updates `step.deliveryState` to `DELIVERED`, and triggers policy evaluation if needed.
+* `SpoolRecoveryService` sweeps pending spool records, applies patches to the database context via `contextWriteService`, updates `step.deliveryState` to `RECOVERED` (or `EXPIRED`), and triggers policy evaluation if needed.
 
 ### 5. Admin Sweep Endpoint
-* `POST /scheduler/reconciliation/run`: Manually triggers an immediate reconciliation pass.
+* `GET` / `POST /admin/v1/scheduler/reconciliation`: Inspects anomalies or triggers a manual reconciliation pass (`ApplyRequest(boolean confirm, List<Integer> jobIds)`).
 * Protected by `SchedulerReconciliationAccessService`, requiring `EXECUTOR_SERVICE` or platform `instanceOwner` membership.
 
 ---
 
 ## 8. Configuration & Operational Tuning Reference
 
-All scheduler parameters are configurable in `application.properties`:
+All scheduler parameters are configurable in `application.properties` (using Spring Boot kebab-case keys):
 
 | Category | Property | Default | Description |
 |---|---|---|---|
-| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.sweepEnabled` | `true` | Master switch for the 30s background reconciliation sweep |
-| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.autoRemediate` | `true` | Enables automatic transition of zero-pending jobs to terminal states |
-| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.admissionGuardEnabled` | `true` | Enables Tier B guarded FIFO queries excluding zero-pending jobs |
-| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.anomalyGraceSeconds` | `300` | Delay before a zero-pending active job is flagged as an anomaly |
+| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.sweep-enabled` | `true` | Master switch for the 30s background reconciliation sweep |
+| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.auto-remediate` | `true` | Enables automatic transition of zero-pending jobs to terminal states |
+| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.admission-guard-enabled` | `true` | Enables Tier B guarded FIFO queries excluding zero-pending jobs |
+| **Reconciliation** | `io.terrakube.api.scheduler.reconciliation.anomaly-grace-seconds` | `300` | Delay before a zero-pending active job is flagged as an anomaly |
+| **Reconciliation** | `io.terrakube.scheduler.reconciliation.heartbeat-grace-period-seconds` | `300` | Grace window before missing executor heartbeats fail a job |
 | **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.enabled` | `true` | Master switch for bounded dispatch-retry backoff |
-| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.maxAttempts` | `8` | Maximum pre-submission dispatch attempts before terminal failure |
-| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.maxElapsedMinutes` | `60` | Maximum overall elapsed time budget for dispatch retries |
-| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.initialBackoffSeconds` | `15` | Base delay for first dispatch retry attempt |
-| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.maxBackoffSeconds` | `900` | Maximum backoff ceiling (15 minutes) |
-| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.admissionDeferralEnabled` | `true` | Enables Tier A FIFO queries excluding jobs in retry backoff |
-| **Inactive Jobs** | `io.terrakube.scheduler.inactive-jobs.maxAgeHours` | `6` | Maximum hours a job may stay open before being failed |
-| **Inactive Jobs** | `io.terrakube.scheduler.inactive-jobs.waitingApprovalTimeoutHours` | `0` | Hours a job may wait for approval before cancellation (0 = disabled) |
-| **Spool Recovery** | `io.terrakube.scheduler.spool-recovery.enabled` | `true` | Enables recovery of spooled structured output |
-| **Spool Recovery** | `io.terrakube.scheduler.spool-recovery.maxBatchSize` | `50` | Maximum spooled records drained per recovery run |
-| **Spool Recovery** | `io.terrakube.scheduler.spool-recovery.delaySeconds` | `60` | Initial delay before starting spool recovery tasks |
+| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.max-attempts` | `8` | Maximum pre-submission dispatch attempts before terminal failure |
+| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.max-elapsed-minutes` | `60` | Maximum overall elapsed time budget for dispatch retries |
+| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.initial-backoff-seconds` | `15` | Base delay for first dispatch retry attempt |
+| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.max-backoff-seconds` | `900` | Maximum backoff ceiling (15 minutes) |
+| **Dispatch Retry** | `io.terrakube.api.scheduler.dispatch-retry.admission-deferral-enabled` | `true` | Enables Tier A FIFO queries excluding jobs in retry backoff |
+| **Inactive Jobs** | `io.terrakube.scheduler.inactive-jobs.max-age-hours` | `6` | Maximum hours a job may stay open before being failed |
+| **Inactive Jobs** | `io.terrakube.scheduler.inactive-jobs.waiting-approval-timeout-hours` | `0` | Hours a job may wait for approval before cancellation (0 = disabled) |
+| **Spool Recovery** | `io.terrakube.api.scheduler.spool-recovery.enabled` | `true` | Enables recovery of spooled structured output |
+| **Spool Recovery** | `io.terrakube.api.scheduler.spool-recovery.batch-size` | `50` | Maximum spooled records drained per recovery run |
+| **Spool Recovery** | `io.terrakube.api.scheduler.spool-recovery.cron` | `*/30 * * ? * *` | Quartz cron cadence for spool recovery |
+| **Dynamic Creds** | `io.terrakube.dynamic.credentials.run-phase.enabled` | `true` | Separates plan vs apply dynamic credential identities |
 
 ---
 

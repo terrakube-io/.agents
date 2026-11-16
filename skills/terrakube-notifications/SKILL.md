@@ -162,8 +162,8 @@ flowchart TD
 
 ### 10. Message Style Formatting (`NotificationMessageStyle`)
 * Terrakube supports two message formatting modes:
-  * `DETAILED` (default): Emits a rich card (Slack Block Kit with Run URL button, Teams Adaptive Card) containing Organization, Workspace, Job ID, Status, Commit, Branch, Author, and Step Failure Summary.
-  * `SIMPLE`: Emits a compact, single-line alert formatted as `[STATUS] Organization / Workspace - Job #<id>`.
+  * `DETAILED` (default): Emits a rich card (Slack Block Kit with Run URL button, Teams Adaptive Card) containing Organization, Workspace, Job ID, Status, Commit, Branch, Author, and Step Failure Summary. (`PolicyNotificationService` always formats policy notifications as `DETAILED` and builds `workspaceUrl`/`runUrl` from `io.terrakube.ui.url`.)
+  * `SIMPLE`: Emits a compact payload (`SlackPayloadBuilder` sends `<workspaceName> - <statusLabel>`, `TeamsPayloadBuilder` sends `<workspaceName> - <jobStatus>`, and `WebhookPayloadBuilder` always sends the structured JSON payload regardless of `messageStyle`).
 
 ### 11. Step Failure Log Tail Extraction (`JobFailureSummaryService`)
 * For jobs that fail during execution, `JobFailureSummaryService` identifies the failing step in `job.getStep()` and retrieves the console log from storage via `StepOutputReader`.
@@ -181,7 +181,7 @@ flowchart TD
 ### 13. Ad-Hoc Testing API (`NotificationTestController` & `NotificationTestService`)
 * Operators can verify webhook destinations before saving or after modifications:
   * `POST /notification/v1/configuration/{configId}/test`: Tests a saved configuration with a synthetic test event.
-  * `POST /notification/v1/organization/{orgId}/notification/test`: Tests a draft/unsaved configuration directly from form inputs.
+  * `POST /notification/v1/organization/{orgId}/configuration/test`: Tests a draft/unsaved configuration directly from form inputs.
 * **Connection Pool Safety**: `NotificationTestService` uses `readOnlyTransactionTemplate` to initialize required entities and commits/closes the database connection **before** issuing the outbound HTTP network call.
 * **SSRF Guard**: Enforces `DestinationUrlValidator` against test URLs, preventing malicious users from utilizing the test endpoint as a port scanner.
 
@@ -214,29 +214,29 @@ erDiagram
         uuid id PK
         uuid organization_id FK
         uuid workspace_id FK
-        varchar type
-        varchar url
+        varchar channel_type
+        varchar destination_url
         varchar signing_secret
-        varchar title
-        varchar description
-        boolean disabled
+        varchar name
+        text description
+        boolean active
         varchar message_style
         timestamp created_date
-        timestamp modified_date
+        timestamp updated_date
     }
 
     notification_trigger {
         uuid id PK
-        uuid notification_configuration_id FK
-        varchar trigger_type
+        uuid configuration_id FK
+        varchar job_status
         timestamp created_date
-        timestamp modified_date
+        timestamp updated_date
     }
 
     notification_outbox {
         uuid id PK
         bigint job_id FK
-        uuid notification_configuration_id FK
+        uuid configuration_id FK
         text payload
         varchar status
         varchar job_status
@@ -245,11 +245,11 @@ erDiagram
         timestamp next_attempt_at
         text last_error
         timestamp created_date
-        timestamp modified_date
+        timestamp updated_date
     }
 
     notification_configuration_template {
-        uuid notification_configuration_id PK,FK
+        uuid configuration_id PK,FK
         uuid template_id PK,FK
     }
 ```
@@ -257,14 +257,14 @@ erDiagram
 ### Key Indexes & Constraints
 1. `notification_configuration`:
    * `idx_notification_configuration_workspace_id` on `(workspace_id)`.
-   * `idx_notification_configuration_org_workspace_null` on `(organization_id)` where `workspace_id IS NULL` (indexes organization-default templates).
+   * `idx_notification_configuration_org_workspace_null` on `(organization_id, workspace_id)`.
 2. `notification_trigger`:
-   * `idx_notification_trigger_configuration_id` on `(notification_configuration_id)`.
+   * `idx_notification_trigger_configuration_id` on `(configuration_id)`.
 3. `notification_outbox`:
    * `idx_notification_outbox_status_last_attempt` on `(status, last_attempt_at)`.
    * Foreign keys to `job` and `notification_configuration` with `ON DELETE CASCADE`.
 4. `notification_configuration_template`:
-   * Composite primary key on `(notification_configuration_id, template_id)`.
+   * Composite primary key on `(configuration_id, template_id)`.
 
 ### Liquibase Changelog Reference
 * `changelog-2.33.0-notification.xml`: Initial creation of `notification_configuration`, `notification_trigger`, and `notification_outbox`.

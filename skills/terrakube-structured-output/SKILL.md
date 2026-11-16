@@ -91,7 +91,7 @@ The `TerraformJsonEventParser` translates machine-readable stdout JSON lines fro
 ### 2. Fast-Plan Immediate Flush Optimization
 * `lastFlush` is initialized to `0` rather than `System.currentTimeMillis()`.
 * **Guarantee**: The very first JSON line always passes the elapsed-time threshold and flushes immediately to the persistence queue.
-* **Problem Prevented**: For short or fast plans that complete in under `APPLY_PROGRESS_FLUSH_INTERVAL_MS` (5,000ms), initializing to `now()` caused the UI to remain on console view for the entire plan duration and only flip to Structured Output after step completion.
+* **Problem Prevented**: For short or fast plans that complete in under `APPLY_PROGRESS_FLUSH_INTERVAL_MS` (`1,000ms`), initializing to `now()` caused the UI to remain on console view for the entire plan duration and only flip to Structured Output after step completion.
 
 ### 3. Diagnostic Extraction & Multiline Splitting
 * `diagnostic` events can be multiline blocks containing headers, code snippets, and explanations.
@@ -104,7 +104,7 @@ The `TerraformJsonEventParser` translates machine-readable stdout JSON lines fro
 ### 1. Live Streaming vs. Summary Reconciliation
 1. **Live Stream Accumulation (`publishPlanProgress`)**:
    - Gathers `planned_change` lines during `terraform plan -json`.
-   - Flushes incremental updates to `StructuredOutputPersistenceQueue` every 5 seconds.
+   - Flushes incremental updates to `StructuredOutputPersistenceQueue` (throttled by `APPLY_PROGRESS_FLUSH_INTERVAL_MS`, `1,000ms`).
 2. **Post-Plan Summary Reconciliation (`publishPlanSummary`)**:
    - Executes `terraform show -json <plan_file>` via `TerraformClient.showPlanJson()`.
    - Passes `terraformEnvironmentVariables` so backend authentication and dynamic cloud credentials remain valid during inspection.
@@ -279,7 +279,7 @@ The API tracks applied revisions inside a top-level `contextRevisions` JSON obje
 * **Legacy Replace Protection (`protectRevisions`)**: If a legacy client performs a full `POST /context/v1/{jobId}` replace, `protectRevisions()` preserves all stored revisioned fields, preventing accidental clobbering.
 
 ### 4. Distributed Redis Write Locking (`ContextWriteLock`)
-* **Key**: `job-context-lock:<jobId>`
+* **Key**: `job-context-write-lock:<jobId>` (`KEY_PREFIX = "job-context-write-lock:"`)
 * **Properties**: 60s TTL, 5s acquire timeout, token compare-and-delete release.
 * **Zero Database Transactions**: No database transaction or table row lock is held during cloud storage reads or writes. If the lock cannot be acquired within 5s, the API fails closed with HTTP 503 (`Retry-After: 5`).
 
@@ -331,8 +331,10 @@ The Terrakube Web UI interprets `/context/v1/{jobId}` using a strict three-state
 
 ### 2. Real-Time Replay via SSE (`/stream`)
 * UI connects to `GET /context/v1/{jobId}/stream`.
-* Supports reconnection via `Last-Event-ID` header containing the Redis stream `RecordId`.
-* `DefaultStructuredSnapshotPersister` triggers `processLogs.sendStructuredUpdate` only after a context patch is confirmed `APPLIED`.
+* Supports reconnection via `Last-Event-ID` header containing the Redis stream `RecordId` (falling back to `0-0` on unparseable or `*` IDs).
+* `StreamingService.streamJobContext` and `ContextController.parseResumeId` emit `event: gap` (`reason: "trimmed"`, `recovery: "context"`) when trimmed history is skipped and `event: end` (`reason: "rotate"` after `sse-max-stream-duration` 30m, or `"complete"`).
+* `useStructuredOutputStream` / `useEventStream` deduplicate events via `compareStreamIds`, reconnect on `rotate`/`overflow` with 250ms + up to 1750ms jitter, and retry transport errors with 1s–30s exponential backoff.
+* `DefaultStructuredSnapshotPersister` (as well as `PlanStructuredOutputService.publishFinalPlanSnapshotSynchronous` and `ApplyStructuredOutputService.publishFinalApplySynchronous`) triggers `processLogs.sendStructuredUpdate` after context persistence.
 
 ---
 
@@ -399,9 +401,11 @@ cd ui && CI=true yarn test --watchAll=false \
 | `terrakube.executor.structured.output.recovery.attempts` | Counter | Delayed recovery executions | - |
 | `terrakube.executor.structured.output.recovery.expired` | Counter | Snapshots expired from delayed recovery | - |
 | `terrakube.executor.structured.output.recovery.evictions` | Counter | Snapshots evicted from delayed recovery | - |
-| `terrakube.api.spool.recovered` | Counter | Spooled patches successfully recovered | - |
-| `terrakube.api.spool.corrupted` | Counter | Corrupted spools purged | - |
-| `terrakube.api.spool.lease.lost` | Counter | DB lease lost during recovery | - |
+| `terrakube.spool.steps.recovered` | Counter | Spooled patches successfully recovered | `phase` |
+| `terrakube.spool.steps.spooled` | Counter | Patches written to cloud storage spool | `phase` |
+| `terrakube.spool.steps.expired` | Counter | Expired spooled patches purged | - |
+| `terrakube.spool.corrupted` | Counter | Corrupted spools purged | - |
+| `terrakube.spool.lease.lost` | Counter | DB lease lost during recovery | - |
 
 ### 3. Diagnostic Commands
 
@@ -420,5 +424,5 @@ curl -N -H "Authorization: Bearer <TOKEN>" \
 
 #### Inspect Active Context Write Lock in Redis
 ```bash
-redis-cli GET "job-context-lock:<JOB_ID>"
+redis-cli GET "job-context-write-lock:<JOB_ID>"
 ```

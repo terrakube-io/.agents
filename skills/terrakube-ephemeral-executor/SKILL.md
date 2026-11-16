@@ -12,12 +12,12 @@ The Ephemeral Executor runs each job/step in an isolated, on-demand Kubernetes `
 ## 1. Dispatch & Activation
 
 ### Activation Condition
-In `ExecutorService.java`, Terrakube checks if the job environment contains:
+In `ExecutorService.java`, Terrakube checks if `TERRAKUBE_ENABLE_EPHEMERAL_EXECUTOR` is present in the job environment and not equal to `"0"` (for example, `"1"`):
 ```
 TERRAKUBE_ENABLE_EPHEMERAL_EXECUTOR=1
 ```
-- **If Present**: Dispatched to `EphemeralExecutorService.send(job, executorContext)`.
-- **If Absent**: Dispatched to `PersistentExecutorService.send(job, executorContext)` via HTTP REST.
+- **If Active (present and `!= "0"`)**: Dispatched to `EphemeralExecutorService.send(job, executorContext)`.
+- **If Absent or `"0"`**: Dispatched to `PersistentExecutorService.send(job, executorContext)` via HTTP REST.
 
 ### Helm Chart Configuration (Cluster-wide)
 To enable the ephemeral executor via Helm:
@@ -48,9 +48,9 @@ rules:
 
 1. **Job Manifest Generation**:
    - `EphemeralExecutorService` constructs a `batch/v1` `Job` named `job-<jobId>-<timestamp>`.
-   - Pod restart policy is set to `Never` and `ttlSecondsAfterFinished` is set to `30`.
+   - Pod restart policy is set to `Never`, `ttlSecondsAfterFinished` defaults to `30`, and `terminationGracePeriodSeconds` defaults to `60` (with configurable `activeDeadlineSeconds` and `backoffLimit`).
 2. **Payload Delivery**:
-   - The `ExecutorContext` is serialized to JSON, Base64-encoded, and passed as environment variable `EphemeralJobData`.
+   - The `ExecutorContext` is serialized to JSON, **encrypted via `EncryptionService.encrypt(jobJson)`**, Base64-encoded, and passed as environment variable `EphemeralJobData`.
    - `EphemeralFlagBatch="true"` is passed to signal batch execution mode.
 3. **Server-Side Apply**:
    - Manifest is submitted via Fabric8 `kubernetesClient.batch().v1().jobs().inNamespace(...).resource(k8sJob).serverSideApply()`.
@@ -58,7 +58,7 @@ rules:
    - `isRetryable(KubernetesClientException)` classifies transient issues (unreachable apiserver, HTTP 429 rate limit, 5xx server errors, HTTP 403 quota exceeded) into `ExecutorUnavailableException` for automatic retry.
    - Genuine misconfigurations or permanent RBAC rejections throw `ExecutionException` to fail immediately.
 5. **Execution inside Container**:
-   - On container startup, `BatchModeServiceImpl` listens for `ContextRefreshedEvent`, decodes `EphemeralJobData`, deserializes into `TerraformJob`, executes the job steps, and terminates.
+   - On container startup, `BatchModeServiceImpl` listens for `ContextRefreshedEvent`, Base64-decodes and decrypts `EphemeralJobData`, deserializes into `TerraformJob`, executes the job steps, and terminates.
 
 ---
 
@@ -68,8 +68,14 @@ rules:
 | Property | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `io.terrakube.executor.ephemeral.namespace` | `ExecutorEphemeralNamespace` | `terrakube` | Target namespace for ephemeral jobs |
-| `io.terrakube.executor.ephemeral.image` | `ExecutorEphemeralImage` | `azbuilder/executor:<version>` | Executor container image |
+| `io.terrakube.executor.ephemeral.image` | `ExecutorEphemeralImage` | `azbuilder/executor:2.34.0` | Executor container image |
 | `io.terrakube.executor.ephemeral.secret` | `ExecutorEphemeralSecret` | `terrakube-executor-secrets` | Comma-separated Secret names mounted via `envFrom` |
+| `io.terrakube.executor.ephemeral.emptyDirSecret` | `ExecutorEphemeralEmptyDirSecret` | `true` (in `application.properties`) | Uses an `emptyDir` secret copy init container for secure shredding |
+| `io.terrakube.executor.ephemeral.initSecretImage` | `ExecutorEphemeralInitSecretImage` | `busybox:1.37.0` | Init container image used when `emptyDirSecret=true` |
+| `io.terrakube.executor.ephemeral.activeDeadlineSeconds` | `ExecutorEphemeralActiveDeadlineSeconds` | Unset | Optional Kubernetes `Job.spec.activeDeadlineSeconds` |
+| `io.terrakube.executor.ephemeral.backoffLimit` | `ExecutorEphemeralBackoffLimit` | Unset (K8s default `6`) | Optional Kubernetes `Job.spec.backoffLimit` |
+| `io.terrakube.executor.ephemeral.ttlSecondsAfterFinished` | `ExecutorEphemeralTtlSecondsAfterFinished` | `30` | Seconds before Kubernetes deletes finished Jobs |
+| `io.terrakube.executor.ephemeral.terminationGracePeriodSeconds` | `ExecutorEphemeralTerminationGracePeriodSeconds` | `60` | Pod `terminationGracePeriodSeconds` |
 | `io.terrakube.executor.ephemeral.nodeSelector.*` | `-Dio.terrakube.executor.ephemeral.nodeSelector.<key>=<value>` | None | Default node selector key-value pairs |
 
 ---
@@ -185,35 +191,39 @@ Dex authenticates against OpenLDAP (default `admin@example.com` / `admin`):
 ```python
 import requests, re, urllib.parse, json, os
 
+API_URL = os.environ.get("TERRAKUBE_API_URL", "https://terrakube-api.localhost")
+UI_URL = os.environ.get("TERRAKUBE_UI_URL", "https://terrakube.localhost")
+API_HOST = urllib.parse.urlparse(API_URL).hostname
+
 s = requests.Session()
-s.verify = "/tmp/rootCA.pem"  # Path to CA certificate
+s.verify = os.environ.get("SSL_CERT_FILE", True)
 
 # 1. Initiate auth code flow
-r1 = s.get("https://terrakube-api.minikube.net/dex/auth?client_id=example-app&redirect_uri=https://terrakube-ui.minikube.net&response_type=code&scope=openid+email+profile+groups&state=123")
+r1 = s.get(f"{API_URL}/dex/auth?client_id=example-app&redirect_uri={UI_URL}&response_type=code&scope=openid+email+profile+groups&state=123")
 action = re.search(r'action="([^"]+)"', r1.text).group(1).replace('&amp;', '&')
-login_url = urllib.parse.urljoin("https://terrakube-api.minikube.net", action)
+login_url = urllib.parse.urljoin(API_URL, action)
 
 # 2. Submit credentials
 r2 = s.post(login_url, data={"login": "admin@example.com", "password": "admin"}, allow_redirects=False)
 loc = r2.headers.get("Location")
 while "code=" not in loc:
-    r2 = s.get(urllib.parse.urljoin("https://terrakube-api.minikube.net", loc), allow_redirects=False)
+    r2 = s.get(urllib.parse.urljoin(API_URL, loc), allow_redirects=False)
     loc = r2.headers.get("Location")
 code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
 
 # 3. Exchange code for JWT id_token
-r3 = s.post("https://terrakube-api.minikube.net/dex/token", data={
+r3 = s.post(f"{API_URL}/dex/token", data={
     "grant_type": "authorization_code",
     "client_id": "example-app",
     "code": code,
-    "redirect_uri": "https://terrakube-ui.minikube.net"
+    "redirect_uri": UI_URL
 })
 id_token = r3.json()["id_token"]
 
 # 4. Save to ~/.terraform.d/credentials.tfrc.json
 os.makedirs(os.path.expanduser("~/.terraform.d"), exist_ok=True)
 with open(os.path.expanduser("~/.terraform.d/credentials.tfrc.json"), "w") as f:
-    json.dump({"credentials": {"terrakube-api.minikube.net": {"token": id_token}}}, f, indent=2)
+    json.dump({"credentials": {API_HOST: {"token": id_token}}}, f, indent=2)
 ```
 
 ### Step 2: Prepare Local Terraform Configuration
@@ -221,7 +231,7 @@ Create a test directory with `main.tf`:
 ```hcl
 terraform {
   cloud {
-    hostname     = "terrakube-api.minikube.net"
+    hostname     = "terrakube-api.localhost" # Or your cluster's API hostname
     organization = "simple"
 
     workspaces {
@@ -241,13 +251,13 @@ output "greeting_output" {
 
 ### Step 3: Run Terraform Init & Apply
 ```bash
-export SSL_CERT_FILE=/tmp/rootCA.pem
+export SSL_CERT_FILE=/path/to/rootCA.pem
 terraform init
 terraform apply -auto-approve
 ```
 
 ### Step 4: Verification Checklist
-1. **Init Container**: `kubectl logs <job-pod> -c copy-executor-secrets` exited `0` with `0600` permissions.
+1. **Init Container**: `kubectl logs <job-pod> -c copy-executor-secrets` exited `0` (directory `chmod 2770 /config-rw`, secret files `chmod 0660`).
 2. **Spring Cloud Bindings**: `kubectl logs <job-pod> -c executor` reports:
    `Added 1 additional CA certificate(s) to system truststore`
    `Spring Cloud Bindings Enabled`
@@ -258,8 +268,8 @@ terraform apply -auto-approve
 
 ## 6. Development & Testing Conventions
 
-- **Unit Testing**: Test all ephemeral executor logic in `EphemeralExecutorServiceTest.java`.
-- **JDK Requirement**: Use Java 25 (`sdk use java 25.0.2-librca`) when running Maven tests:
+- **Unit Testing**: Test all ephemeral executor logic in `EphemeralExecutorServiceTest.java` and configuration mapping in `EphemeralConfigurationTest.java`.
+- **JDK Requirement**: Use Java 25 when running Maven tests:
   ```bash
-  source ~/.sdkman/bin/sdkman-init.sh && sdk use java 25.0.2-librca && mvn test -Dtest=EphemeralExecutorServiceTest
+  mvn test -Dtest="EphemeralExecutorServiceTest,EphemeralConfigurationTest" -pl api
   ```

@@ -5,7 +5,7 @@ description: Internal token classification taxonomy, live step-bound token valid
 
 # Terrakube Internal Token Architecture & Microservice Access Control Guide
 
-This guide details the internal token classification taxonomy, live step-bound token validation, microservice permissions for `terrakube/executor` and `terrakube/registry`, Elide JSON:API security checks, runtime process isolation, ephemeral secrets lifecycle, and security best practices established in the TK-01 remediation and subsequent hardening milestones.
+This guide details the internal token classification taxonomy, live step-bound token validation, microservice permissions for `terrakube/executor` and `terrakube/registry`, Elide JSON:API security checks, runtime process isolation, ephemeral secrets lifecycle, and security hardening patterns across Terrakube.
 
 ---
 
@@ -198,7 +198,7 @@ Microservice operations are strictly partitioned using dedicated Elide `@Securit
 * **`IsRegistryService` (`user is a registry service`)**:
   Matches exclusively `InternalTokenType.REGISTRY_SERVICE`.
 * **`ExecutorManageHistory` (`executor manage history`)**:
-  Permits creating state history records exclusively for the Executor daemon (`EXECUTOR_SERVICE`).
+  A `WORKSPACE_EXECUTOR` check validating `workspaceId`, `organizationId`, and `jobId` claims when creating state history records (paired on `History` with `executor manage history OR user is an executor service`).
 
 ### 2. Granular Workspace Runner Security Checks (`io.terrakube.api.rs.checks.executor.*`)
 
@@ -227,7 +227,7 @@ Runner tokens are explicitly rejected from reading sensitive infrastructure cred
 Any JPA `@Entity` field containing executable workflows, templates, or internal state machine data MUST be annotated with `@Exclude`:
 
 ```java
-// io.terrakube.api.rs.job.Job
+// io.terrakube.api.rs.job.Job (and deprecated Schedule.tcl)
 @Exclude
 @Column(name = "tcl")
 private String tcl;
@@ -250,7 +250,7 @@ The Terraform state storage endpoint enforces multi-layered authorization:
     - Cross-workspace read (`terraform_remote_state`): Permitted ONLY if the target workspace belongs to the same organization AND either has `globalRemoteState = true` OR lists the caller's workspace ID in `sharedIds`.
 * **Step Flow-Type Write Enforcement (`isStepWriteAuthorized`)**:
   - Validates the step flow type via `tclService.getFlowTypeForStep(job, step.getStepNumber())`.
-  - State mutation (`POST` / `PUT` / `DELETE` to `/remote/tfe/v2/state/...`) is restricted strictly to:
+  - State mutation (`GET` / `POST` / `PUT` / `DELETE` to `/tfstate/v1/organization/{organizationId}/workspace/{workspaceId}/backend/terraform.tfstate` in `TerraformStateController`) is restricted strictly for writes (`POST` / `PUT` / `DELETE`) to:
     - `terraformApply`
     - `terraformDestroy`
     - `customScripts`
@@ -262,12 +262,12 @@ The Terraform state storage endpoint enforces multi-layered authorization:
 * **Federated Identifiers**: Can read job logs through team permissions but are barred from calling `canWriteContext()`.
 
 ### 3. Pinned Version Gateway (`JobResolvedVersionController`)
-* Pinned Terraform/OpenTofu version registration (`PUT /organization/{orgId}/job/{jobId}`) is strictly restricted to `InternalTokenType.EXECUTOR_SERVICE`.
+* Pinned Terraform/OpenTofu version registration (`PUT /version/v1/organization/{orgId}/job/{jobId}`) is strictly restricted to `InternalTokenType.EXECUTOR_SERVICE`.
 * Runner tokens exposed to user scripts cannot alter pinned tool versions.
 * Validates `ActiveStepTokenValidator.isTerminalStatus()` to ensure completed jobs cannot have their version modified.
 
 ### 4. Scheduler Reconciliation Gateway (`SchedulerReconciliationAccessService`)
-* Triggering scheduler sweeps (`/scheduler/reconciliation/run`) requires `EXECUTOR_SERVICE` or a user belonging to the configured `instanceOwner` group.
+* Triggering scheduler sweeps (`GET` / `POST /admin/v1/scheduler/reconciliation`) requires `EXECUTOR_SERVICE` or a user belonging to the configured `instanceOwner` group.
 * `WORKSPACE_EXECUTOR` runner tokens are strictly denied.
 
 ---
@@ -293,7 +293,7 @@ if (canExecute("unshare", "--map-root-user", "--user", "--pid", "--fork", "--mou
 * **Security Effect**: The child process runs inside an isolated PID namespace with its own mounted `/proc`. The parent JVM PID does not exist inside the namespace, neutralizing procfs environment variable harvesting.
 
 ### 3. Environment Variable Sanitization
-When spawning external processes, `ProcessLauncher.clearEnvironment()` wipes the process environment map, followed by whitelisting ONLY safe system variables:
+When spawning external processes, `ProcessLauncher.clearEnvironment()` wipes the process environment map, followed by `BashEngine` and `GroovyEngine` whitelisting ONLY safe system variables (`SAFE_SYSTEM_ENV`):
 * **`SAFE_SYSTEM_ENV`**: `PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`.
 * **Stripped Secrets**: `InternalSecret`, database passwords, Redis passwords (`TerrakubeRedisPassword`), cloud provider root keys (`AwsTerraform*`, `AzureTerraform*`, `GcpTerraform*`).
 * **Context Injections**: Injects only job-specific variables (`organizationId`, `workspaceId`, `jobId`, `stepId`, `terrakubeApi`) and a short-lived scoped `terrakubeToken` (5 minutes).
@@ -324,6 +324,8 @@ When spawning external processes, `ProcessLauncher.clearEnvironment()` wipes the
   - Minted with a 60-minute duration matching the job execution window.
   - Carries unique `jti = jobId-stepId`.
   - Cleaned up via `workspaceSecurity.cleanTerraformCredentials()` in the guaranteed `finally` block of `ExecutorJobImpl.java`.
+* **HTTP Backend Credentials (`HttpTerraformStateImpl`)**:
+  - Mints `TF_HTTP_PASSWORD` with `tokenTtlMinutes` (default `360`, tied to `ExecutorJobMaxDurationMinutes`).
 * **Runner Tokens for Scripts**:
   - Groovy and Bash runners receive a scoped `terrakubeToken` with a **5-minute expiration** (`generateAccessToken(5, ...)`).
 

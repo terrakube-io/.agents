@@ -12,15 +12,18 @@ The Terrakube UI is a single-page application built with React, TypeScript, Vite
 ## 1. Directory & Stack Overview
 
 - **Location**: `terrakube/ui`
-- **Package Manager**: `yarn`
+- **Package Manager**: `yarn` (`yarn@4.15.0`, Node 24)
+- **Stack**: React 19, TypeScript, Ant Design 6, `react-router-dom` 7
 - **Build Tool**: Vite (`vite build`)
 - **Testing**: Jest + `@testing-library/react`
-- **Linting & Formatting**: ESLint + Prettier
+- **Linting & Formatting**: ESLint (flat config `eslint.config.js`) + Prettier
 
 Key module paths:
-- `src/modules/`: Domain-driven module packages (organizations, workspaces, projects, api, etc.)
-- `src/domain/`: Core and legacy feature views (Jobs, Workspaces, Settings)
-- `src/components/`: Shared UI components
+- `src/modules/`: Domain-driven module packages (`api`, `apiDocs`, `organizations`, `permissions`, `projects`, `token`, `user`, `utils`, `workspaces`)
+- `src/domain/`: Core and legacy feature views (`Home`, `Jobs`, `Login`, `Modules`, `Notifications`, `Organizations`, `Providers`, `Settings`, `Workspaces`) — `Home/App.tsx` configures `createBrowserRouter` with lazy-loaded `@/modules/*` pages and workspace settings sub-routes
+- `src/components/`: Shared UI components (`display`, `feedback`, `forms`, `layout`, `modals`, `navigation`, `settings`)
+- `src/hooks/`: Custom hooks (including SSE/streaming hooks like `useEventStream` and `useStructuredOutputStream`)
+- `src/config/`, `src/context/`, `src/types/`: App configuration, auth/OIDC context, and shared TypeScript types
 
 ---
 

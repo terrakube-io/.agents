@@ -46,21 +46,21 @@
 * All benchmark executions must adhere to the concurrency staging (`5, 10, 25` workers), fixture provisioning, and OpenTelemetry / Prometheus PromQL metric conventions.
 * Guidelines: .agents/skills/terrakube-registry-performance/SKILL.md
 
-## 10. Modular Storage Architecture & Container Image Splitting (`terrakube/storage`)
-* Cloud storage implementations (AWS S3, Azure Blob, GCP Cloud Storage, Local) are maintained as independent Spring Boot 3 starters under `terrakube/storage`.
-* Consuming components (`registry`, `api`, `executor`) must use Maven profiles (`-Paws`, `-Pazure`, `-Pgcp`, default `-Pall`) and Spring Boot 3 `@AutoConfiguration` to support split container images.
-* Guidelines: .agents/skills/terrakube-modular-storage/SKILL.md
+## 10. Storage Backends (`api`, `registry`, `executor`)
+* Storage implementations currently live inside each service (`io.terrakube.api.plugin.storage.{aws,azure,gcp,local}`, `io.terrakube.registry.plugin.storage.{aws,azure,gcp,local}`, and `io.terrakube.executor.plugin.tfstate.{aws,azure,gcp,http,local}`). Note: the experimental `terrakube-modular-storage` split is disabled (`SKILL.disable.md`) and not part of `terrakube` `main`.
 
 ## 11. External HTTP Client & WebClient Conventions
 * Singleton services that inject `WebClient.Builder` MUST call `.clone()` before applying per-request mutations (`.defaultHeader(...)`, `.defaultHeaders(...)`, `.filter(...)`, `.baseUrl(...)`, `.clientConnector(...)`).
 * Static clients must be built once in the constructor and stored as immutable `private final WebClient webClient`.
+* In `terrakube/api`, pair `WebClient.Builder.clone()` with `ReactorNettyWebClientFactory` (30s response / 10s connect timeouts, 32 KiB max header size) and Reactor `.timeout(...)` deadlines where needed.
 * Guidelines: rules/http-client-conventions.md
 
 ## 12. Job Processing, FIFO Queue & Distributed Locking (`io.terrakube.api.plugin.scheduler`)
 * Job dispatching, two-tier queueing (per-workspace serialization and cluster-level FIFO), and distributed locking are orchestrated in `io.terrakube.api.plugin.scheduler`.
-* Any new scheduler trigger or lifecycle hook MUST respect the Redis execution lock (`job-execution-lock:<jobId>` with 90s TTL) and fail closed if Redis is unreachable.
-* FIFO admission queries MUST use the guarded executable variants (`isJobNextInDispatchOrderExecutable` / `findNextDispatchableExecutableJobId`) to prevent head-of-line blocking from jobs with no remaining executable steps.
-* The execution lock MUST be released immediately upon receiving HTTP 202 Accepted from the executor and MUST NOT be held during the long-running execution of Terraform.
+* Any new scheduler trigger or lifecycle hook MUST use `ExecutionLease` (`job-execution-lock:<jobId>`, 90s TTL, 30s renewal, token-checked Lua release) and fail closed if Redis is unreachable.
+* FIFO admission queries MUST use the guarded executable variants (`isJobNextInDispatchOrderExecutableNotDeferred` / `isJobNextInDispatchOrderExecutable` / `findNextDispatchableExecutableNotDeferredJobId`) to prevent head-of-line blocking.
+* `ExecutorService.sendClaimed()` MUST claim `job-dispatch-claim:<jobId>:<stepId>` while holding the lease before submitting to an executor, and the lease MUST be released in `finally` right after dispatch (never held during Terraform execution).
+* `DynamicCredentialsService.runPhase()` separates plan vs apply dynamic identities, and Vault logins are bounded via `WebClient` + Reactor `.timeout(...)` (failing the job on `DynamicCredentialsException`).
 * Guidelines: .agents/skills/terrakube-job-scheduler/SKILL.md
 
 ## 13. OPA Policy Governance & Fleet Architecture (`io.terrakube.api.plugin.policy`)
@@ -90,10 +90,11 @@
 ## 16. RBAC & Team Permission Architecture (`io.terrakube.api.rs.team`, `ProjectAccess`, `Access`)
 * Terrakube implements a 3-tier RBAC model (`Team` at Organization level, `ProjectAccess` at Project level, and `Access` at Workspace level) evaluated via `RbacV2Service`.
 * Predefined roles (`admin`, `write`, `plan`, `read`) supersede fine-grained boolean flags. The `custom` role (or null) falls back to evaluating individual boolean flags.
-* Whenever creating or seeding `Team` records in Liquibase or tests, ALL 12 permission attributes MUST be populated:
+* Whenever creating or seeding `Team` records in Liquibase or tests, ALL 13 permission attributes (`role` + 12 boolean flags) MUST be populated:
   - `role`: `"admin"`, `"write"`, `"plan"`, `"read"`, or `"custom"`
-  - `manage_state`, `manage_collection`, `manage_job`, `manage_workspace`, `manage_module`, `manage_provider`, `manage_vcs`, `manage_template`, `manage_policies`, `plan_job`, `approve_job`
+  - `manage_state`, `manage_collection`, `manage_job`, `manage_workspace`, `manage_module`, `manage_provider`, `manage_vcs`, `manage_template`, `manage_policies`, `plan_job`, `approve_job`, `destroy_job`
 * Administrative teams (e.g. `TERRAKUBE_ADMIN`) MUST have `role="admin"` and all boolean flags set to `true`.
+* Job creation (`JobApprovalHook` `CREATE` -> must start `pending`), status transitions (`TeamApproveJob*`), `require_approve_to_apply`, and `restrict_apply_to_configured_branch` are enforced across Elide hooks/checks, `RemoteTfeService`, and webhook triggers.
 * Guidelines: .agents/skills/terrakube-rbac-permissions/SKILL.md
 
 ## 17. Terrakube UI (`terrakube/ui`)
@@ -115,12 +116,12 @@
   - Fail closed by default on missing tickets, tokens, or security parameters (never allow missing input to bypass checks).
   - Classify all tokens via `InternalTokenClassifier` (`NOT_INTERNAL`, `WORKSPACE_EXECUTOR`, `EXECUTOR_SERVICE`, `REGISTRY_SERVICE`, `UNKNOWN_INTERNAL`).
   - Never grant blanket group membership (`isServiceMember` / `isMember`) or superuser status to any internal machine token.
-  - Contextually scope `WORKSPACE_EXECUTOR` tokens: must strictly match target workspace/job/step UUIDs and must NEVER access cross-workspace state, private SSH keys, or VCS tokens.
+  - Contextually scope `WORKSPACE_EXECUTOR` tokens: must strictly match target workspace/job/step UUIDs (`ExecutorManageJob`, `ExecutorManageJobStep`, `ExecutorManageHistory`, etc.) and must NEVER access cross-workspace state, private SSH keys, or VCS tokens.
   - Partition microservices with dedicated subjects (`EXECUTOR_SERVICE`, `REGISTRY_SERVICE`) and Elide checks (`IsExecutorService`, `IsRegistryService`).
   - Unauthenticated endpoints (e.g., CLI redirects) must be completely stateless with zero DB queries and zero internal UUID exposure.
   - Spawning dynamic scripts (Groovy, Bash) must execute out-of-process via child JVM/process runners with host secrets (`InternalSecret`, Redis passwords, cloud credentials) stripped.
-  - Temporary credential files (`~/.terraformrc`) must use short-lived tokens with `jti` and be purged in post-execution `finally` blocks.
-  - Entity fields containing workflow YAML or execution logic (e.g., `Job.tcl`) must use `@Exclude` to prevent external template injection.
+  - Temporary credential files (`~/.terraformrc`) must use short-lived tokens with `jti` (revoked live via DB `Step` status or `pat`/`team_token` checks) and be purged in post-execution `finally` blocks.
+  - Entity fields containing workflow YAML or execution logic (`Job.tcl`, `Schedule.tcl`) must use `@Exclude` to prevent external template injection.
   - Guidelines: rules/security-authorization.md
 
 ## 20. Workspace Dependency Graph & Run Triggers (`io.terrakube.api.rs.workspace.trigger`, `io.terrakube.api.plugin.scheduler.trigger`)
@@ -136,8 +137,8 @@
 * Guidelines: .agents/skills/terrakube-run-triggers/SKILL.md
 
 ## 21. Terrakube Templates & Workflow Language (TCL) (`io.terrakube.api.plugin.scheduler.job.tcl`)
-* Workflow templates are defined in YAML (`flow: [...]`) and execute sequential steps (`terraformPlan`, `terraformApply`, `terraformDestroy`, `customScripts`, `approval`).
-* Commands execute using either `GROOVY` (isolated out-of-process JVM) or `BASH` (subshell).
+* Workflow templates are defined in YAML (`flow: [...]`) and execute sequential steps (`terraformPlan`, `terraformApply` with optional `requireSavedPlan`, `terraformDestroy`, `customScripts`, `approval`, `policyEvaluation`).
+* Commands execute using either `GROOVY` (isolated out-of-process JVM using `groovy-all` 6.0.0) or `BASH` (subshell).
 * Groovy commands execute without ambient host secrets, receiving short-lived scoped JWT tokens and job context variables (`terrakubeApi`, `terrakubeToken`, `jobId`, `stepId`, `workingDirectory`, `terrakubeOutput`).
 * Extensions in `.terrakube/toolsRepository` (e.g., `Context.groovy`) are automatically added to the Groovy classpath and enable sharing structured state and artifacts across steps via `/context/v1/${jobId}`.
 * Cross-command state in Bash is persisted by appending key-value pairs to `$terrakubeEnv`.
@@ -146,9 +147,9 @@
 ## 22. Internal Token Architecture & Microservice Access Controls (`io.terrakube.api.plugin.security.token`)
 * Tokens are classified into 5 discrete tiers (`NOT_INTERNAL`, `WORKSPACE_EXECUTOR`, `EXECUTOR_SERVICE`, `REGISTRY_SERVICE`, `UNKNOWN_INTERNAL`).
 * Internal machine tokens are barred from user group membership and platform superuser status.
-* Microservice permissions for Executor and Registry are partitioned using dedicated Elide checks (`IsExecutorService`, `IsRegistryService`, `ExecutorManageHistory`).
+* Microservice permissions for Executor and Registry are partitioned using dedicated Elide checks (`IsExecutorService`, `IsRegistryService`), while `WORKSPACE_EXECUTOR` step tokens use UUID-scoped checks (`ExecutorManageJob`, `ExecutorManageJobStep`, `ExecutorManageHistory`).
 * Groovy scripts execute out-of-process with scrubbed environments (`GroovyProcessRunner`), neutralizing reflection attacks.
-* Sensitive entity fields are excluded from external Elide manipulation (`@Exclude` on `Job.tcl`).
+* Sensitive entity fields are excluded from external Elide manipulation (`@Exclude` on `Job.tcl` and `Schedule.tcl`).
 * Guidelines: .agents/skills/terrakube-internal-tokens/SKILL.md
 
 ## 23. Terraform CLI-Driven Workflow & Remote Execution (`/remote/tfe/v2/*`)

@@ -134,7 +134,7 @@ erDiagram
         uuid id PK "VARCHAR(36)"
         bigint job_id FK "BIGINT NOT NULL -> job.id"
         uuid step_id FK "VARCHAR(36) NOT NULL -> step.id"
-        varchar status "VARCHAR(50) NOT NULL [PASSED, WARNING, WAITING_APPROVAL, FAILED]"
+        varchar status "VARCHAR(50) NOT NULL [PASSED, FAILED, WARNING, EXEMPTED, OVERRIDDEN]"
         int passed_rules "INT DEFAULT 0"
         int warning_rules "INT DEFAULT 0"
         int soft_mandatory_violations "INT DEFAULT 0"
@@ -155,7 +155,7 @@ erDiagram
     WORKSPACE {
         uuid id PK "VARCHAR(36)"
         varchar name "VARCHAR(255) NOT NULL"
-        varchar policy_compliance_status "VARCHAR(50) [COMPLIANT, NON_COMPLIANT, OVERRIDDEN, UNKNOWN]"
+        varchar policy_compliance_status "VARCHAR(50) [COMPLIANT, NON_COMPLIANT, EXEMPTED, UNKNOWN]"
         uuid organization_id FK "VARCHAR(36) -> organization.id"
     }
 
@@ -202,7 +202,7 @@ erDiagram
 | **`PolicyExemption`** | `policy_exemption` | `id` (UUID / VARCHAR 36) | `policy_set_id` (NOT NULL), `organization_id` (NOT NULL), `workspace_id`, `project_id` | Time-bounded rule waiver for specific workspace or project with mandatory ticket reference and justification. |
 | **`PolicyEvaluation`** | `policy_evaluation` | `id` (UUID / VARCHAR 36) | `job_id` (BIGINT NOT NULL), `step_id` (UUID NOT NULL) | Records evaluation results for a specific Terraform plan step (`passed`, `warning`, `soft_mandatory`, `hard_mandatory`, `shadow_*`). 1:1 with `PolicyOverride`. |
 | **`PolicyOverride`** | `policy_override` | `id` (UUID / VARCHAR 36) | `evaluation_id` (UUID NOT NULL UNIQUE) | Immutable audit log capturing who approved a `soft_mandatory` violation and when, with required justification. |
-| **`Workspace`** | `workspace` | `id` (UUID / VARCHAR 36) | `organization_id`, `project_id` | Augmented with `policy_compliance_status` (`COMPLIANT`, `NON_COMPLIANT`, `OVERRIDDEN`, `UNKNOWN`). |
+| **`Workspace`** | `workspace` | `id` (UUID / VARCHAR 36) | `organization_id`, `project_id` | Augmented with `policy_compliance_status` (`COMPLIANT`, `NON_COMPLIANT`, `EXEMPTED`, `UNKNOWN`). |
 | **`Team`** | `team` | `id` (UUID / VARCHAR 36) | `organization_id` | Augmented with `manage_policies` (BOOLEAN NOT NULL DEFAULT false) permission column. |
 
 ---
@@ -230,15 +230,15 @@ All declarative governance entities are managed through Elide JSON:API and Graph
   * `Job`: `/api/v1/job/{id}/policyEvaluation`
   * `Step`: `/api/v1/step/{id}/policyEvaluation`
 
-### B. Spring MVC Remote State Plane (`RemoteTfeController.java` under `/api/v2`)
+### B. Spring MVC Remote State Plane (`RemoteTfeController.java` under `/remote/tfe/v2`)
 Provides TFE CLI and external runner compatibility for runtime policy check evaluation, ANSI log streaming, and SecOps override actions:
 
 | Route & HTTP Method | Request / Response Format | Description & Behavior | RBAC / Authorization |
 | :--- | :--- | :--- | :--- |
-| `GET /api/v2/runs/{runId}/policy-checks` | `application/vnd.api+json`<br/>-> `PolicyCheckList` | Lists all policy check evaluations for a given run (`Job`). Automatically strips `run-` prefix. | Authenticated via JWT `principal`. Validates user access to organization/workspace. |
-| `GET /api/v2/policy-checks/{id}` | `application/vnd.api+json`<br/>-> `PolicyCheckData` | Retrieves single policy check details, violation counts, and status. Automatically strips `polchk-` prefix or parses raw UUID. Returns 404 if not found. | Authenticated via JWT `principal`. |
-| `GET /api/v2/policy-checks/{id}/output` | `text/plain` | Streams human-readable ANSI terminal output summarizing passed, advisory, soft-mandatory, and hard-mandatory rules. | Authenticated via JWT `principal`. |
-| `POST /api/v2/policy-checks/{id}/actions/override` | Consumes optional JSON:<br/>`{ "justification": "..." }`<br/>Returns: `PolicyCheckData` | Submits SecOps policy override for a check with `soft_mandatory` violations. Creates immutable `PolicyOverride` audit record, transitions evaluation status to `PASSED`, and enables run resumption. Rejects checks with `hard_mandatory` violations (HTTP 400). | Checked via `validateUserCanOverridePolicy`: User must be an Org Admin or member of configured `overrideTeam`. |
+| `GET /remote/tfe/v2/runs/{runId}/policy-checks` | `application/vnd.api+json`<br/>-> `PolicyCheckList` | Lists all policy check evaluations for a given run (`Job`). Automatically strips `run-` prefix. | Authenticated via JWT `principal`. Validates user access to organization/workspace. |
+| `GET /remote/tfe/v2/policy-checks/{id}` | `application/vnd.api+json`<br/>-> `PolicyCheckData` | Retrieves single policy check details, violation counts, and status. Automatically strips `polchk-` prefix or parses raw UUID. Returns 404 if not found. | Authenticated via JWT `principal`. |
+| `GET /remote/tfe/v2/policy-checks/{id}/output` | `text/plain` | Streams human-readable ANSI terminal output summarizing passed, advisory, soft-mandatory, and hard-mandatory rules. | Authenticated via JWT `principal`. |
+| `POST /remote/tfe/v2/policy-checks/{id}/actions/override` | Consumes optional JSON:<br/>`{ "justification": "..." }`<br/>Returns: `PolicyCheckData` | Submits SecOps policy override for a check with `soft_mandatory` violations. Creates immutable `PolicyOverride` audit record, transitions evaluation status to `OVERRIDDEN` (and check status to `overridden`), and enables run resumption. Rejects checks with `hard_mandatory` violations (HTTP 400). | Checked via `validateUserCanOverridePolicy`: User must be an Org Admin or member of configured `overrideTeam`. |
 | `@ExceptionHandler(IllegalArgumentException.class)` | `application/vnd.api+json`<br/>HTTP 400 | Returns standard JSON:API formatted error envelope on malformed IDs or illegal override attempts. | N/A |
 
 ---
@@ -298,7 +298,7 @@ Parameters are configured directly at the `PolicySet` level (via the Web UI or A
 * **Rego Usage**: Policies access parameters directly through `data.terrakube.inputs.<key>`.
 
 ### Critical Quartz Job Invariant: Avoid Lazy Loading Outside Sessions
-In Terrakube, `ScheduleJob.doRunExecution` intentionally runs without a surrounding Hibernate transaction so individual repository operations commit independently and the Redis distributed lock (`job-execution-lock:<jobId>`) is released cleanly.
+In Terrakube, `ScheduleJob.doRunExecution` intentionally runs without a surrounding Hibernate transaction so individual repository operations commit independently and the Redis `ExecutionLease` (`job-execution-lock:<jobId>`) is renewed and released cleanly.
 
 > [!CAUTION]
 > **Never Access `@OneToMany` Lazy Collections on Detached Entities in Background Jobs**:
@@ -442,16 +442,17 @@ sequenceDiagram
 
 #### 4. Approval & Resumption
 * **Approval Actions**:
-  - Authorized team members can submit a policy override via the UI drawer (`POST /api/v2/runs/{jobId}/policy-checks/actions/override`) with a mandatory justification.
+  - Authorized team members can submit a policy override via the UI drawer (`POST /remote/tfe/v2/policy-checks/{id}/actions/override`) with a mandatory justification.
   - Organization admins or members of `approvalTeam` approve the job (setting `status = "approved"`).
 * **Resumption**:
   - Quartz detects `job.status == "approved"` and invokes `executeApprovedJobs(job)`, which transitions the job back to `pending` and dispatches `terraformApply`.
 
-### VCS Feedback & PR Comments
-`PrCommentService` posts rich Markdown summaries to GitHub/GitLab pull requests:
-* Visual status header (Passed / Warning / Failed).
-* Table of violations grouped by Policy Set, Rule ID, Severity, and Resource Address.
-* Pull request commit status check updated (`pending`, `success`, `failure`).
+### VCS Feedback, Notifications & PR Comments
+* `PrCommentService.renderPolicyGuardrailsSummary()` posts rich Markdown summaries to GitHub/GitLab pull requests:
+  * Null-safe violation rendering (`hasNonNull()` checks, falling back to `policySetId` when `policySetName` is absent, normalizing `SOFT_MANDATORY` -> `soft-mandatory`).
+  * Status headers: `FAILED`, `FAILED (SOFT-MANDATORY)`, `PASSED (OVERRIDDEN)`, `PASSED (WITH EXEMPTION)`, `PASSED (WITH WARNINGS)`, or `PASSED`.
+  * Pull request commit status check updated (`pending`, `success`, `failure`).
+* `PolicyNotificationService` builds `workspaceUrl`/`runUrl` from `io.terrakube.ui.url` and dispatches policy alerts using `NotificationMessageStyle.DETAILED`.
 
 ---
 
@@ -576,12 +577,12 @@ When validating unreleased provider features locally:
 # ~/.terraformrc
 provider_installation {
   dev_overrides {
-    "terrakube-io/terrakube" = "/home/user/go/bin"
+    "terrakube-io/terrakube" = "<path-to-go-bin>"
   }
   direct {}
 }
 ```
-Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terrakube .`.
+Compile provider using `go build -v -o <path-to-go-bin>/terraform-provider-terrakube .`.
 
 ---
 
@@ -595,8 +596,7 @@ Compile provider using `go build -v -o /home/user/go/bin/terraform-provider-terr
 2. **Backend API**:
    Verify cumulative policy resolution and scheduler non-transactional safety:
    ```bash
-   source "$HOME/.sdkman/bin/sdkman-init.sh"
-   mvn test -Dtest="PolicyResolutionServiceTest,ScheduleJobTest,PolicyEvaluationServiceTest"
+   mvn test -Dtest="PolicyResolutionServiceTest,ScheduleJobTest,PolicyEvaluationServiceTest" -pl api
    ```
 3. **Fleet Terraform Testing**:
    Run `terraform plan` and `terraform apply` in `terrakube-governance` to provision workspaces, policy sets, and attachments.
@@ -638,7 +638,7 @@ Terrakube provides two specialized Quartz background jobs to maintain continuous
     ```
   - **Executor Optimization**: In `SetupWorkspaceImpl`, the executor detects `"policyEvaluation"` and **bypasses workspace git clone and tarball download**.
   - `OpaExecutorServiceImpl.evaluateJob()` downloads `plan.json` directly from storage and evaluates all policy sets against it.
-  - Updates `Workspace.policyComplianceStatus` (`COMPLIANT`, `NON_COMPLIANT`, `OVERRIDDEN`) and records `PolicyEvaluation` entries without altering live workspace state.
+  - Updates `Workspace.policyComplianceStatus` (`COMPLIANT`, `NON_COMPLIANT`, `EXEMPTED`) and records `PolicyEvaluation` entries without altering live workspace state.
 
 ### 2. Audit Retention & Storage Pruning (`PolicyEvaluationRetentionJob`)
 * **Purpose**: Enforces enterprise data retention policies and prevents unbounded database and object storage growth from daily drift evaluations and historical plan runs.

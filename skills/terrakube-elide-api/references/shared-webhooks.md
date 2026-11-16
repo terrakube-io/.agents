@@ -1,6 +1,6 @@
-# Shared Webhook Architecture & Async Reconciliation (GitHub & GitLab)
+# Shared Webhook Architecture & Async Reconciliation (GitHub, GitLab & Azure DevOps)
 
-This guide documents the shared repository webhook architecture (v2) implemented in Terrakube for GitHub and GitLab VCS integrations.
+This guide documents the shared repository webhook architecture (v2) implemented in Terrakube for GitHub, GitLab, and Azure DevOps (`AZURE_SP_MI` / `AZURE_DEVOPS`) VCS integrations.
 
 ## 1. Overview & Problem Solved
 In Terrakube v1, each workspace registered its own webhook directly with GitHub or GitLab. When multiple workspaces were created for the same repository URL, this led to duplicate webhook registrations, VCS API rate limiting, and redundant event handling.

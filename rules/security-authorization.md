@@ -18,8 +18,8 @@ All development across Terrakube API, Executor, and Client modules MUST strictly
   ```
 * All tokens handled by Terrakube API MUST be classified using `InternalTokenClassifier` into `InternalTokenType`:
   - `NOT_INTERNAL`: Real user or federated identities. Only these tokens can evaluate user group claims or claim platform administrator/superuser roles.
-  - `WORKSPACE_EXECUTOR`: Ephemeral step-runner tokens (`iss=TerrakubeInternal` with `workspaceId`). Effective groups MUST return an empty set (`[]`), superuser MUST return `false`, and access MUST be strictly constrained to matching entity UUIDs via `ExecutorManageJob`, `ExecutorManageJobStep`, etc.
-  - `EXECUTOR_SERVICE`: Backend Executor service daemon (`sub=TerrakubeInternal (EXECUTOR)`). Zero group membership, zero superuser status. Authorized exclusively via dedicated Elide checks (`IsExecutorService`, `ExecutorManageHistory`).
+  - `WORKSPACE_EXECUTOR`: Ephemeral step-runner tokens (`iss=TerrakubeInternal` with `workspaceId`). Effective groups MUST return an empty set (`[]`), superuser MUST return `false`, and access MUST be strictly constrained to matching entity UUIDs (`workspaceId`/`organizationId`/`jobId`) via `ExecutorManageJob`, `ExecutorManageJobStep`, `ExecutorManageHistory`, etc.
+  - `EXECUTOR_SERVICE`: Backend Executor service daemon (`sub=TerrakubeInternal (EXECUTOR)`). Zero group membership, zero superuser status. Authorized exclusively via dedicated Elide checks (`IsExecutorService`).
   - `REGISTRY_SERVICE`: Backend Registry service daemon (`sub=TerrakubeInternal (REGISTRY)`). Zero group membership, zero superuser status. Authorized exclusively via `IsRegistryService`.
   - `UNKNOWN_INTERNAL`: Any internal token with unrecognized subject, or legacy `TerrakubeInternal (TOKEN)` without `workspaceId`. Fails closed with zero permissions.
 * **Service Tokens:** Never grant global superuser status to machine tokens. Microservice interactions must be protected by dedicated Elide checks (`IsExecutorService`, `IsRegistryService`).
@@ -41,10 +41,10 @@ All development across Terrakube API, Executor, and Client modules MUST strictly
 
 ## 5. Ephemeral Credential Lifetimes & Guaranteed Teardown
 * Tokens written to disk or container filesystems (such as `~/.terraformrc` credentials) MUST have short expirations strictly matching the job duration (e.g., 60 minutes or `jobTimeout`), NEVER long durations like 30 days.
-* All generated JWTs MUST include a unique `jti` claim to allow immediate revocation in Redis upon job cancellation or completion.
+* All generated JWTs MUST include a unique `jti` claim and support immediate revocation: `WORKSPACE_EXECUTOR` step tokens are verified live against the database `Step` row via `ActiveStepTokenValidator` (`stepRepository.findById` + `isTerminalStatus`), while PAT and team tokens are checked against active rows in `pat` and `team_token` (`DexAuthenticationManagerResolver.isTokenActive`).
 * Credential files created during workspace setup MUST be scrubbed (overwritten and deleted) inside guaranteed `finally` teardown blocks upon job completion or failure.
 
 ## 6. Elide Resource & Field Protection (`@Exclude`)
-* Any JPA `@Entity` field containing executable workflows, templates, or internal state machine data (e.g., `Job.tcl`) MUST be annotated with `@Exclude` to prevent callers from modifying or injecting malicious payloads via Elide JSON:API or GraphQL endpoints.
+* Any JPA `@Entity` field containing executable workflows, templates, or internal state machine data (e.g., `Job.tcl`, deprecated `Schedule.tcl`) MUST be annotated with `@Exclude` to prevent callers from modifying or injecting malicious payloads via Elide JSON:API or GraphQL endpoints.
 * Elide security check expressions MUST use space-separated words without underscores (e.g. `user is an executor service`).
 

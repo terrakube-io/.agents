@@ -21,12 +21,15 @@ The local development stack runs in Docker under the `terrakube-network` bridge 
 | **Terrakube API** | `https://terrakube-api.localhost` | `80`, `443` | JSON:API / GraphQL endpoints (`terrakube-api-https:8080`) |
 | **Terrakube Registry** | `https://terrakube-registry.localhost` | `80`, `443` | Module & Provider registry (`terrakube-registry-https:8075`) |
 | **Dex OIDC Issuer** | `https://terrakube-dex.localhost/dex` | `80`, `443` | OIDC IdP for local auth & CLI login (`terrakube-dex-https:5556`) |
-| **Terrakube Executor** | `http://terrakube-executor:8090/api/v1/terraform-rs` | Internal | Container DNS (also routed as `https://terrakube-executor.localhost`) |
+| **Terrakube Executor** | `http://localhost:8090/api/v1/terraform-rs` (via `AzBuilderExecutorUrl`) | Internal (`terrakube-dev`) | Runs inside `terrakube-dev` with API/Registry; Traefik router labels are commented out in `docker-compose.yml` |
 | **`postgresql-service`** | `postgresql-service:5432` | `5432` | User: `terrakube`, DB: `terrakubedb`, Pass: `terrakubepassword` |
 | **`redis-service`** (Valkey) | `terrakube-redis:6379` | Internal | Auth: `password123456` |
 | **`minio`** (Silo) | `terrakube-minio:9000` (API) / `localhost:9001` | `9000`, `9001` | User: `minioadmin`, Pass: `minioadmin`, Bucket: `sample` |
 | **`traefik`** | `terrakube-traefik` | `80`, `443` | Reverse proxy terminating TLS via local `mkcert` certificates |
-| **`terrakube-dev`** | `terrakube-dev` | — | Devcontainer workspace (`/workspaces/terrakube`) |
+| **`terrakube-dev`** | `terrakube-dev` | — | Devcontainer workspace (`/workspaces/terrakube`, Java 25 `25.0.1-librca`, Node 24) |
+
+> [!NOTE]
+> `scripts/setupDevelopmentEnvironment.sh` defaults to `TerraformStateType=HttpTerraformStateImpl` + `TerraformStateHttpBackend=true`, whereas `.devcontainer/devcontainer.json` `postCreateCommand` passes `-s MINIO` (`AwsTerraformStateImpl` + `TerraformStateHttpBackend=false`).
 
 ---
 
@@ -89,7 +92,7 @@ LIMIT 10;
 
 Check why a job is blocked (inspect active steps):
 ```sql
-SELECT id, step_number, status, name, executor
+SELECT id, step_number, status, name, delivery_state
 FROM step
 WHERE job_id = <JOB_ID>
 ORDER BY step_number ASC;
@@ -121,7 +124,7 @@ UPDATE step SET status = 'cancelled' WHERE job_id = <JOB_ID> AND status IN ('pen
 ### 4. Policy Evaluations & Violations
 Check policy scan results for a job:
 ```sql
-SELECT id, job_id, status, total_policies, passed_policies, failed_policies, violations_url, created_date
+SELECT id, job_id, step_id, status, passed_rules, warning_rules, soft_mandatory_violations, hard_mandatory_violations, storage_uri, created_date
 FROM policy_evaluation
 ORDER BY created_date DESC
 LIMIT 5;
@@ -129,7 +132,7 @@ LIMIT 5;
 
 Check policy overrides:
 ```sql
-SELECT id, job_id, policy_id, approved_by, comment, created_date
+SELECT id, evaluation_id, overridden_by, overridden_at, justification, created_date
 FROM policy_override
 ORDER BY created_date DESC;
 ```
@@ -137,7 +140,7 @@ ORDER BY created_date DESC;
 ### 5. Outbox Notifications (Webhook / Slack Deliveries)
 Inspect pending or failed notifications:
 ```sql
-SELECT id, destination_type, status, retry_count, last_error, created_date
+SELECT id, job_id, configuration_id, status, job_status, attempt_count, last_error, created_date
 FROM notification_outbox
 ORDER BY created_date DESC
 LIMIT 10;
@@ -167,5 +170,5 @@ To test modifications to the `terraform-spring-boot` library live against the lo
 5. Launch **"Run Executor"** via VS Code debugger (`F5`).
 
 For full command sequences, troubleshooting, and gotchas, consult:
-- [.agents/skills/terraform-spring-boot-starter/SKILL.md](file:///home/user/git/terrakube-io/.agents/skills/terraform-spring-boot-starter/SKILL.md#6-upgrading--testing-in-devcontainer-live-environment)
+- `../terraform-spring-boot-starter/SKILL.md` (Section 6: Upgrading & Testing in Devcontainer Live Environment) in the org `.agents` repository.
 

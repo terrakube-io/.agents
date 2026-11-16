@@ -150,7 +150,7 @@ Terrakube uses **Liquibase** to manage database migrations across supported RDBM
 
 When introducing a new domain model or REST API capability to Terrakube:
 1. [ ] **Liquibase**: Create changelog XML in `db/changelog/local/` and include it in `changelog.xml`.
-2. [ ] **JPA/Elide Entity**: Create `@Entity` in `io.terrakube.api.rs.<domain>` with `@Include`, Lombok getters/setters, UUID converter, and standard audit fields (`GenericAuditFields`).
+2. [ ] **JPA/Elide Entity**: Create `@Entity` in `io.terrakube.api.rs.<domain>` with `@Include`, Lombok getters/setters, `@JdbcTypeCode(Types.VARCHAR)` + `@GeneratedValue(strategy = GenerationType.UUID)` on `UUID id`, and standard audit fields (`GenericAuditFields`).
 3. [ ] **Security Checks**: Define custom `OperationCheck<T>` classes in `io.terrakube.api.rs.checks.<domain>` annotated with `@SecurityCheck(RULE)`.
 4. [ ] **Entity Permission Binding**: Annotate the entity class and/or sensitive fields with `@ReadPermission`, `@CreatePermission`, `@UpdatePermission`, `@DeletePermission`.
 5. [ ] **Lifecycle Hooks**: If business side-effects (creating resources, notifying webhooks, validating data) are needed, create a `LifeCycleHook<T>` implementation in `io.terrakube.api.rs.hooks.<domain>` and bind it via `@LifeCycleHookBinding`.
@@ -159,7 +159,7 @@ When introducing a new domain model or REST API capability to Terrakube:
 
 ## 6. Shared Repository Webhooks & Async Reconciliation Architecture
 
-When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and GitLab v2 webhooks):
+When managing VCS webhooks shared across multiple workspaces (e.g., GitHub, GitLab, and Azure DevOps v2 webhooks):
 
 1. **Elide Lifecycle Hook Binding (`WebhookManageHook` & `WebhookEventManageHook`)**:
    - Synchronous operations (e.g. legacy per-workspace hook deletion) run in `PRECOMMIT`.
@@ -182,50 +182,48 @@ When managing VCS webhooks shared across multiple workspaces (e.g., GitHub and G
    - Validate fanout job generation filtering by branch pattern, file changes, and priority.
    - **Reflection-based binding tests**: Add `WebhookLifeCycleHookBindingTest` and `WebhookEventLifeCycleHookBindingTest` using `getAnnotationsByType(LifeCycleHookBinding.class)` to verify `@LifeCycleHookBinding` registrations directly, as standard unit tests invoking `execute()` bypass Elide annotation bindings.
 
-For code examples and detailed architectural breakdown, see [shared-webhooks.md](file:///home/user/git/terrakube-io/.agents/skills/terrakube-elide-api/references/shared-webhooks.md).
+For code examples and detailed architectural breakdown, see [shared-webhooks.md](references/shared-webhooks.md).
 
 ---
 
 ## 7. Compilation & JDK Requirements
 
-Terrakube modules (`terrakube/executor`, `terrakube/api`, `terrakube/registry`) require **JDK 25** (`25.0.2-librca`), whereas `terraform-spring-boot` requires **JDK 21** (`21.0.9-librca`).
+Terrakube platform modules (`executor`, `api`, `registry`) require **JDK 25** (`<java.version>25</java.version>`), whereas `terraform-spring-boot` requires **JDK 21**.
 
-### Switching JDK via SDKMAN for `terrakube` Compilation:
+### Switching JDK via SDKMAN for Compilation:
 ```bash
 # Switch to JDK 25 in current shell context:
-sdk use java 25.0.2-librca
+sdk use java 25.0.1-librca
 
-# Or execute Maven command inline with explicit JDK 25 environment:
-JAVA_HOME=/home/user/.sdkman/candidates/java/25.0.2-librca PATH=/home/user/.sdkman/candidates/java/25.0.2-librca/bin:$PATH mvn compile -pl executor
+# Or execute Maven with an explicit JDK 25 JAVA_HOME:
+mvn compile -pl executor
 ```
 
 ---
 
 ## 8. Terraform & OpenTofu Binary Caching Architecture
 
-Terrakube Executor caches Terraform and OpenTofu binaries in cloud storage to prevent fresh Kubernetes pods from re-downloading binaries from HashiCorp or GitHub endpoints.
+Terrakube Executor caches Terraform and OpenTofu binaries in cloud storage to prevent fresh Kubernetes pods from re-downloading binaries from HashiCorp or GitHub endpoints. Cached binaries are keyed by OS and architecture so mixed-architecture executors sharing one storage backend never restore an incompatible binary.
 
 ### 8.1 `TerraformState` Interface Methods
-* `saveTerraformBinary(String version, boolean tofu, File binaryFile)`: Uploads binary executable to storage. Default implementation returns `false`.
-* `downloadTerraformBinary(String version, boolean tofu, File targetFile)`: Downloads cached binary executable from storage and sets executable permissions (`setExecutable(true, true)`). Default implementation returns `false`.
+* `saveTerraformBinary(String version, boolean tofu, String os, String arch, File binaryFile)`: Uploads binary executable to storage. Default implementation returns `false`.
+* `downloadTerraformBinary(String version, boolean tofu, String os, String arch, File targetFile)`: Downloads cached binary executable from storage and sets executable permissions (`setExecutable(true, true)`). Default implementation returns `false`.
 
 ### 8.2 Storage Provider Implementations & Keys
-* **AWS S3** (`AwsTerraformStateImpl`): `tfbinary/{product}/{version}/{product}` in configured bucket.
-* **Azure Blob** (`AzureTerraformStateImpl`): Container `tfbinary`, blob path `{product}/{version}/{product}`.
-* **GCP Storage** (`GcpTerraformStateImpl`): `tfbinary/{product}/{version}/{product}` in configured GCS bucket.
-* **Local Storage** (`LocalTerraformStateImpl`): `/.terraform-spring-boot/local/binary/{product}/{version}/{product}` under user home directory.
+* **AWS S3** (`AwsTerraformStateImpl`): `tfbinary/{product}/{version}/{os}_{arch}/{product}` in configured bucket.
+* **Azure Blob** (`AzureTerraformStateImpl`): Container `tfbinary`, blob path `{product}/{version}/{os}_{arch}/{product}`.
+* **GCP Storage** (`GcpTerraformStateImpl`): `tfbinary/{product}/{version}/{os}_{arch}/{product}` in configured GCS bucket.
+* **Local Storage** (`LocalTerraformStateImpl`): `/.terraform-spring-boot/local/binary/{product}/{version}/{os}_{arch}/{product}` under user home directory.
 
-### 8.3 Executor Orchestration (`TerraformExecutorServiceImpl`)
+### 8.3 Executor Orchestration (`TerraformExecutorServiceImpl` & `BinaryCacheRecoveryService`)
 Before and after `terraformClient.init()`:
 1. **Pre-Init Check (`ensureBinaryCached`)**:
-   - Resolves constraint to concrete version via `TerraformDownloader.resolveTerraformVersion()` / `resolveTofuVersion()`.
-   - Computes expected local binary path via `TerraformDownloader.getTerraformBinaryPath()`.
-   - If binary exists locally on disk: skips network/storage checks.
-   - If missing locally: calls `terraformState.downloadTerraformBinary(...)` to restore from storage.
+   - Resolves constraint to concrete version via `JobVersionPinner` / `TerraformDownloader` (with leading `v` stripped for OpenTofu).
+   - Delegates to `BinaryCacheRecoveryService.resolve(resolvedVersion, tofu)` under a per-`(product, version)` lock.
+   - `BinaryCacheRecoveryService` validates any existing local binary (`isValidExecutable`), deletes corrupt/incomplete local binaries or zip archives (`InvalidArchiveReason`), and otherwise attempts `terraformState.downloadTerraformBinary(resolvedVersion, tofu, BinaryArchiveLocator.os(), BinaryArchiveLocator.arch(), binaryFile)`.
+   - Re-throws `BinaryCacheRecoveryException` if a corrupt cached archive/binary cannot be cleaned up so the job fails cleanly rather than looping on a broken cache entry.
 2. **Post-Init Cache Backup (`saveBinaryToCache`)**:
-   - If binary was missing from storage and `init` completed successfully, uploads the newly downloaded binary to cloud storage via `terraformState.saveTerraformBinary(...)`.
-3. **Fail-Safe Design**:
-   - All caching operations are wrapped in `try-catch` blocks that log warnings on failure, ensuring job execution always falls back gracefully to standard downloading.
+   - If the binary was not already cached (`!binaryWasAlreadyCached`) and `init` completed successfully, validates `binaryCacheRecoveryService.isValidExecutable(binaryFile)` and uploads it via `terraformState.saveTerraformBinary(resolvedVersion, tofu, BinaryArchiveLocator.os(), BinaryArchiveLocator.arch(), binaryFile)` (cache upload failures are logged as warnings).
 
 ---
 

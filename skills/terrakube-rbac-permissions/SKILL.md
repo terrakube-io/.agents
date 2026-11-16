@@ -1,6 +1,6 @@
 ---
 name: terrakube-rbac-permissions
-description: Comprehensive architecture, 3-tier scoping hierarchy (Organization, Project, Workspace), predefined roles, 13 fine-grained boolean flags (including destroy_job), execution hooks (JobRunRightsHook, JobApprovalHook), requireApproveToApply governance, RemoteTfeService integration, Liquibase conventions, and test JWT token generation for Terrakube RBAC.
+description: Comprehensive architecture, 3-tier scoping hierarchy (Organization, Project, Workspace), predefined roles, 12 fine-grained boolean flags (including destroy_job) plus role (13 permission attributes), execution hooks (JobRunRightsHook, JobApprovalHook, JobBranchPolicyHook), job status transition guards, requireApproveToApply & branch restriction governance, RemoteTfeService integration, Liquibase conventions, and test JWT token generation for Terrakube RBAC.
 ---
 
 # Terrakube RBAC & Permission Architecture Guide
@@ -137,17 +137,22 @@ Runs at Elide's `PREFLUSH` lifecycle phase during job creation (`Operation.CREAT
    If missing, throws `JobRightForbiddenException` with HTTP 403.
 3. Because this runs at `PREFLUSH`, refused jobs are **never persisted** to the database.
 
-### 4.2 Pre-Approval Validation: `JobApprovalHook`
-Runs at Elide's `PRECOMMIT` phase when updating a job to `status = approved`:
-1. **Wait State Verification**: Jobs can only transition to `approved` from `waitingApproval`. Creating a job as `approved` or approving a job while still planning throws `PolicyBlocksApprovalException`.
-2. **Destroy Approval Check**: Approving a run whose template destroys (`tclService.templateDestroys(...) != NO`) requires `JobRunRights.canDestroy()`. Users with approve-only rights cannot approve destroy runs.
-3. **OPA Policy Gate**: Verifies that no blocking OPA policy evaluations remain (`policyApprovalGuard.blockingReason`).
+### 4.2 Pre-Approval & Status Transition Validation: `JobApprovalHook` & Elide Transition Checks
+`JobApprovalHook` runs at Elide's `PRECOMMIT` phase on both `CREATE` and `UPDATE`:
+1. **Creation Status Enforcement (`Operation.CREATE`)**: New jobs MUST start with `JobStatus.pending`; creating a job directly in `approved` or any other non-`pending` status throws `PolicyBlocksApprovalException`.
+2. **Wait State Verification (`Operation.UPDATE`)**: Jobs can only transition to `approved` from `waitingApproval`. Approving a job while still planning or in another state throws `PolicyBlocksApprovalException`.
+3. **Destroy Approval Check**: Approving a run whose template destroys (`tclService.templateDestroys(...) != NO`) requires `JobRunRights.canDestroy()`. Users with approve-only rights cannot approve destroy runs.
+4. **OPA Policy Gate**: Verifies that no blocking OPA policy evaluations remain (`policyApprovalGuard.blockingReason`).
+
+In addition, Elide update checks on `Job.status` enforce strict state transitions:
+- `TeamApproveJob` restricts `isApprovalTransition` (`waitingApproval -> approved | rejected`) and `isCancellationTransition` (`holdsTheQueue() -> cancelled`).
+- `TeamApproveJobRbac`, `TeamLimitedApproveJob`, and `TeamProjectLimitedApproveJob` restrict RBAC users to valid approval/cancellation transitions (`isRbacUserTransition`), while `Job` `@CreatePermission` requires `team plan job` (or workspace/project limited plan/manage permissions).
 
 ### 4.3 Workspace Governance Settings (`Workspace.java`)
 - **`require_approve_to_apply`** (`requireApproveToApply`, default `false`):
   Opt-in workspace setting requiring the `approve_job` capability even to trigger an apply that has no approval step. Guarded by `@UpdatePermission(expression = "user is a superuser OR team manage workspace")` (only organization-level workspace managers can toggle).
 - **`restrict_apply_to_configured_branch`** (`restrictApplyToConfiguredBranch`, default `false`):
-  Ensures applies and destroys can only be executed against the configured workspace branch, preventing untrusted branches from mutating production infrastructure.
+  Ensures applies and destroys can only be executed against the configured workspace branch, preventing untrusted branches from mutating production infrastructure. Guarded by `@UpdatePermission(expression = "user is a superuser OR team manage workspace")` and enforced across `WorkspaceBranchPolicy`, `JobBranchPolicyHook`, `JobBranchFieldsEditable` (protecting `Job.overrideBranch` and `Job.commitId`), `RemoteTfeService`, and `WebhookService`/`RepoWebhookService`.
 
 ### 4.4 Terraform CLI Remote Execution (`RemoteTfeService`)
 When users execute Terraform via the CLI (`terraform plan`, `terraform apply`, `terraform destroy`):
@@ -156,9 +161,11 @@ When users execute Terraform via the CLI (`terraform plan`, `terraform apply`, `
    - `can-queue-apply`: requires `validateUserApproveJob`.
 2. **`createRun` Enforcement**:
    - `terraform destroy` (or destroy templates with `autoApply = true`): requires `jobRunRights.canDestroy`.
+   - `autoApply = true`: requires `validateUserApproveJob`.
    - Apply without approval on `requireApproveToApply = true` workspace: requires `jobRunRights.canApprove`.
-3. **`applyRun` Enforcement**:
+3. **`applyRun` & `runDiscard` Enforcement**:
    - Confirming/applying a run that destroys requires `jobRunRights.canDestroy`.
+   - `runDiscard` requires `validateUserApproveJob` and `job.getStatus().holdsTheQueue()` (otherwise returns `409 Conflict`).
 
 ---
 
@@ -267,12 +274,12 @@ The `Team` entity requires `user is a superuser` for mutation. Requests must be 
 
 ### 6.2 Managing Project Access
 Governed by `team manage project access OR team project limited manage project access`:
-* **Endpoint**: `POST /api/v1/project/{projectId}/projectAccess`
+* **Endpoint**: `POST /api/v1/project/{projectId}/projectAccess` (or `/api/v1/project_access`)
 * **Payload**:
 ```json
 {
   "data": {
-    "type": "projectAccess",
+    "type": "project_access",
     "attributes": {
       "name": "BILLING_TEAM",
       "role": "plan",
@@ -326,15 +333,16 @@ To test fine-grained RBAC or new group permissions in live clusters without modi
   * `iss`: `"Terrakube"` (must match `jwtTypePat`)
   * `aud`: `"Terrakube"`
   * `sub`: `"<User Name> (Token)"`
-  * `jti`: Random UUID string (or registered PAT UUID in `pat` table)
+  * `jti`: Registered PAT UUID in the `pat` database table (or `team_token` UUID for group tokens) — `DexAuthenticationManagerResolver.isTokenActive()` rejects any `"Terrakube"` JWT whose `jti` does not match an active non-deleted row in `pat` or `team_token` with `BadCredentialsException("Token is revoked or unknown")`.
   * `email`: User email address
   * `name`: User display name
   * `groups`: Array of string group names (e.g. `["INFRA_OPERATIONS"]`)
 
 ### Python Helper Script for Minting Tokens
+Note: Register the `pat_id` (`jti`) in the `pat` table (or issue a PAT via `/pat/v1` first) so `DexAuthenticationManagerResolver.isTokenActive()` accepts it.
 
 ```python
-import jwt, datetime, subprocess, base64, uuid
+import jwt, datetime, subprocess, base64
 
 # 1. Retrieve PatSecret from Kubernetes / Minikube
 pat_k8s = subprocess.check_output([
@@ -347,15 +355,15 @@ pat_k8s = subprocess.check_output([
 raw_pat = base64.b64decode(pat_k8s).decode()
 pat_bytes = base64.urlsafe_b64decode(raw_pat + '=' * (-len(raw_pat) % 4))
 
-# 3. Mint JWT token
-def mint_group_token(email: str, name: str, groups: list[str]) -> str:
+# 3. Mint JWT token bound to an active pat.id row
+def mint_group_token(pat_id: str, email: str, name: str, groups: list[str]) -> str:
     now = datetime.datetime.now(datetime.UTC)
     exp = now + datetime.timedelta(days=30)
     return jwt.encode({
         'iss': 'Terrakube',
         'sub': f'{name} (Token)',
         'aud': 'Terrakube',
-        'jti': str(uuid.uuid4()),
+        'jti': pat_id,
         'email': email,
         'email_verified': True,
         'name': f'{name} (Token)',
@@ -364,8 +372,8 @@ def mint_group_token(email: str, name: str, groups: list[str]) -> str:
         'exp': exp
     }, pat_bytes, algorithm='HS256', headers={'typ': 'JWT'})
 
-# Example: Generate token for INFRA_OPERATIONS
-token = mint_group_token('ops@example.com', 'Operations User', ['INFRA_OPERATIONS'])
+# Example: Generate token for INFRA_OPERATIONS (using an active pat.id UUID)
+token = mint_group_token('<ACTIVE_PAT_UUID>', 'ops@example.com', 'Operations User', ['INFRA_OPERATIONS'])
 ```
 
 ---
@@ -379,8 +387,8 @@ When developing, verifying, or debugging RBAC permissions, run the following aut
 # Core RBAC role resolution tests
 mvn test -Dtest="RbacV2ServiceTest"
 
-# Execution rights and lifecycle hook tests (destroy permission, requireApproveToApply)
-mvn test -Dtest="JobRunRightsTest,JobApprovalHookTest,JobRunRightsTests"
+# Execution rights, status transitions, and lifecycle hook tests
+mvn test -Dtest="JobRunRightsTest,JobApprovalHookTest,JobApprovalSecurityChecksTest,JobRunRightsTests"
 
 # Terraform CLI and Remote execution run rights tests
 mvn test -Dtest="RemoteTfeRunRightsTests"

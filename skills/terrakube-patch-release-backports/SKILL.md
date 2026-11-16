@@ -5,7 +5,7 @@ description: End-to-end workflow for discovering, validating, cherry-picking, te
 
 # Terrakube Patch Release Backport Workflow
 
-This skill documents the standard operational procedure for backporting merged bugfix pull requests from `main` to a maintenance release branch (e.g., `release/2.34.X`) for a patch milestone (e.g., `2.34.1`).
+This skill documents the standard operational procedure for backporting merged bugfix pull requests from `main` to a maintenance release branch (e.g., `release/2.34.X`) for a patch milestone (e.g., `2.34.3`).
 
 ---
 
@@ -13,7 +13,7 @@ This skill documents the standard operational procedure for backporting merged b
 
 In Terrakube repositories:
 * **Release Branches:** Track maintenance releases using `.X` notation: `release/<major>.<minor>.X` (e.g., `release/2.33.X`, `release/2.34.X`).
-* **Release Tags:** Mark specific releases using full semver: `<major>.<minor>.<patch>` (e.g., `2.34.0`, `2.34.0-rc.1`).
+* **Release Tags:** Mark specific releases using full semver: `<major>.<minor>.<patch>` (e.g., `2.34.0`, `2.34.2`, `2.34.0-rc.1`).
 * **Base Target:** All backport branches must branch off `origin/release/<major>.<minor>.X` and submit pull requests targeting base branch `release/<major>.<minor>.X`. NEVER attempt to target or branch from a tag.
 
 ---
