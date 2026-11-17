@@ -98,7 +98,9 @@
 
 ## 17. Terrakube UI (`terrakube/ui`)
 * The Terrakube UI application must be developed in `terrakube/ui` using `yarn`.
-* Linting and formatting in CI strictly enforce ESLint and Prettier (`yarn lint:modules:check`, `yarn format:modules:check`). Run `yarn lint:modules` to auto-fix formatting issues.
+* CI enforces ESLint, Prettier, and TypeScript across all of `src` (`yarn lint:check`, `yarn format:check`, `yarn typecheck`); `yarn check` runs them plus the tests. Run `yarn lint` to auto-fix lint and formatting issues.
+* New code goes in `src/modules/` and `src/components/`; `src/domain/` is the older layout. New API calls use `apiGet`/`apiPost`/`apiPut`/`apiDelete` from `@/modules/api/apiWrapper`.
+* Keep heavy libraries (Monaco, Scalar, react-markdown, reactflow, acorn, sucrase) out of the first-load bundle: lazy routes or `await import()` only.
 * Unused variables and imports MUST be eliminated to satisfy `@typescript-eslint/no-unused-vars`.
 * Always use non-interactive Jest execution (`yarn test --watchAll=false` or `CI=true yarn test`) when running tests in automated environments.
 * Guidelines: .agents/skills/terrakube-ui/SKILL.md
