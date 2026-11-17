@@ -155,6 +155,7 @@
 ## 23. Terraform CLI-Driven Workflow & Remote Execution (`/remote/tfe/v2/*`)
 * Terrakube implements the HashiCorp Terraform Cloud / Enterprise Remote Execution protocol.
 * CLI-supplied variables (`-var`, `--var`, `-var-file`) are parsed strictly as HCL literals via `CliRunVariables` and prioritized over workspace variables using `job.variables_as_arguments = true`.
+* End-to-end testing of private Registry modules/providers alongside CLI workspaces requires dual-host `.tfrc` credentials (API + Registry), non-expired tokens, and `.terraform/` in `.terraformignore` for remote runs.
 * Testing remote workflows and troubleshooting ingress, TLS, token auth, and Minikube container caching must follow:
   - Guidelines: .agents/skills/terrakube-cli-driven-workflow/SKILL.md
 

@@ -1,6 +1,6 @@
 ---
 name: terrakube-cli-driven-workflow
-description: End-to-end guide for testing and troubleshooting Terraform CLI-driven remote execution workflows in Terrakube, including authentication, parameter passing (-var, --var, -var-file), Minikube live testing, and diagnostic runbooks.
+description: End-to-end guide for testing and troubleshooting Terraform CLI-driven local/remote execution workflows and private Registry modules/providers in Terrakube, including Dex/Federated/Internal authentication, dual-host .tfrc setup, .terraformignore rules, parameter passing (-var, --var, -var-file), Minikube live testing, and diagnostic runbooks.
 ---
 
 # Terrakube Terraform CLI-Driven Workflow & Troubleshooting Guide
@@ -42,7 +42,7 @@ Local Terminal                    Terrakube API                  PostgreSQL & St
 ## 2. Client Authentication & Environment Setup
 
 ### 2.1 Credentials Configuration
-Terraform CLI reads API tokens from `~/.terraform.d/credentials.tfrc.json`:
+Terraform CLI reads API tokens from `~/.terraform.d/credentials.tfrc.json` (or `TF_CLI_CONFIG_FILE`):
 ```json
 {
   "credentials": {
@@ -53,8 +53,12 @@ Terraform CLI reads API tokens from `~/.terraform.d/credentials.tfrc.json`:
 }
 ```
 
-#### Generating a Dev Token via Dex / Python
-In local devcontainer (`terrakube-dex.localhost`) or Kubernetes/Minikube environments with Dex:
+#### Environment Hostnames (Devcontainer vs Minikube)
+- **Devcontainer:** `API_URL = "https://terrakube-api.localhost"`, `UI_URL = "https://terrakube.localhost"`, `REG_HOST = "terrakube-registry.localhost"`
+- **Minikube:** `API_URL = "https://terrakube-api.minikube.net"`, `UI_URL = "https://terrakube-ui.minikube.net"`, `REG_HOST = "terrakube-reg.minikube.net"`, `SSL_CERT_FILE = "/home/user/.local/share/mkcert/rootCA.pem"`
+
+#### Checking Token Expiry & Refreshing a Dex JWT via Python
+Dex `id_token` JWTs expire (typically 24 hours). Always verify `exp` before running E2E scripts (`jwt.decode(token, options={"verify_signature": False})["exp"] > time.time()`); if expired (`401 Unauthorized` on the first API call), refresh `~/.terraform.d/credentials.tfrc.json` against `/dex/auth` and `/dex/token` (using the exact ingress `UI_URL`, e.g., `https://terrakube-ui.minikube.net` on Minikube or `https://terrakube.localhost` in devcontainer):
 ```python
 import json, os, re, requests, urllib.parse
 
@@ -86,6 +90,21 @@ token = r3.json()["id_token"]
 os.makedirs(os.path.expanduser("~/.terraform.d"), exist_ok=True)
 with open(os.path.expanduser("~/.terraform.d/credentials.tfrc.json"), "w") as f:
     json.dump({"credentials": {API_HOST: {"token": token}}}, f, indent=2)
+```
+
+#### Dual-Host `.tfrc` (`TF_CLI_CONFIG_FILE`) for Private Registry Modules & Providers
+When a Terraform CLI workspace uses `cloud { hostname = ... }` **and** resolves private Registry modules or providers (`source = "terrakube-reg.minikube.net/<org>/<name>/<provider>"`), `terraform init` requires credentials for **both** the API host and the Registry host. Generate a scoped `.tfrc` file and pass it via `TF_CLI_CONFIG_FILE` alongside `SSL_CERT_FILE`:
+```hcl
+credentials "terrakube-api.minikube.net" {
+  token = "<USER_TOKEN>"
+}
+credentials "terrakube-reg.minikube.net" {
+  token = "<USER_TOKEN>"
+}
+```
+```bash
+export SSL_CERT_FILE=/home/user/.local/share/mkcert/rootCA.pem
+export TF_CLI_CONFIG_FILE=/path/to/terraformrc.tfrc
 ```
 
 ### 2.2 TLS / Custom CA Certificates
@@ -198,12 +217,17 @@ terraform plan -var-file=test.tfvars -var sample_var=cli-override-wins
 
 ## 5. Testing Code Changes in Minikube
 
-When modifying API or Executor code (e.g. PR testing):
+When modifying API, Registry, or Executor code (e.g. PR testing):
 
 ### 5.1 Compile Images
 ```bash
+# API + Executor
 mvn -pl "api,executor" spring-boot:build-image -B --file pom.xml -Dmaven.test.skip=true
+
+# API + Registry (produces docker.io/library/api-server:2.34.0 and open-registry:2.34.0)
+mvn -pl "api,registry" spring-boot:build-image -B --file pom.xml -Dmaven.test.skip=true
 ```
+- **Local `terrakube-spring-boot-starter` changes:** If testing an unreleased client starter version, update `<revision>` across all starter POMs before installing (`mvn versions:set-property -Dproperty=revision -DnewVersion=<ver> -DgenerateBackupPoms=false` then `mvn clean test install -Dgpg.skip=true -B`) so transitive modules (such as `terrakube-client`) resolve the matching version in `~/.m2/repository`, then restore the starter POMs. Passing `-Drevision=...` only on the CLI leaves `<revision>1.9.0</revision>` in child POMs.
 
 ### 5.2 Avoid the Minikube Image Caching Trap
 > [!WARNING]
@@ -213,20 +237,24 @@ mvn -pl "api,executor" spring-boot:build-image -B --file pom.xml -Dmaven.test.sk
 ```bash
 # 1. Tag with unique identifier
 docker tag docker.io/library/api-server:2.34.0 azbuilder/api-server:test-pr-XYZ
+docker tag docker.io/library/open-registry:2.34.0 azbuilder/open-registry:test-pr-XYZ
 docker tag docker.io/library/executor:2.34.0 azbuilder/executor:test-pr-XYZ
 
 # 2. Load into Minikube containerd store
 minikube image load azbuilder/api-server:test-pr-XYZ
+minikube image load azbuilder/open-registry:test-pr-XYZ
 minikube image load azbuilder/executor:test-pr-XYZ
 
-# 3. Update deployments
-kubectl -n terrakube set image deployment/terrakube-api api-server=azbuilder/api-server:test-pr-XYZ
+# 3. Update deployments (note container names: terrakube-api, terrakube-registry, executor)
+kubectl -n terrakube set image deployment/terrakube-api terrakube-api=azbuilder/api-server:test-pr-XYZ
+kubectl -n terrakube set image deployment/terrakube-registry terrakube-registry=azbuilder/open-registry:test-pr-XYZ
 kubectl -n terrakube set env deployment/terrakube-api ExecutorEphemeralImage=azbuilder/executor:test-pr-XYZ
 kubectl -n terrakube set image deployment/terrakube-executor executor=azbuilder/executor:test-pr-XYZ
 
 # 4. Wait for rollouts
-kubectl -n terrakube rollout status deployment/terrakube-api
-kubectl -n terrakube rollout status deployment/terrakube-executor
+kubectl -n terrakube rollout status deployment/terrakube-api --timeout=180s
+kubectl -n terrakube rollout status deployment/terrakube-registry --timeout=180s
+kubectl -n terrakube rollout status deployment/terrakube-executor --timeout=180s
 ```
 
 ### 5.3 Verify Database Migration
@@ -237,7 +265,51 @@ kubectl -n terrakube logs deployment/terrakube-api | grep -i "ChangeSet db/chang
 
 ---
 
-## 6. Troubleshooting Runbook
+## 6. End-to-End Testing: Private Modules, Providers & Authentication Modes
+
+### 6.1 Seeding & Cleaning Up Temporary Private Providers (Elide JSON:API)
+When an environment only has public/existing modules (e.g. `aws/vpc/aws`), seed a temporary private provider via `POST` with an org-authorized user token (`manageProvider=true` team):
+1. Create provider: `POST /api/v1/organization/{orgId}/provider` (`"type": "provider"`, `"attributes": {"name": prov_name, "description": "..."}`)
+2. Create version: `POST /api/v1/organization/{orgId}/provider/{providerId}/version` (`"type": "version"`, `"attributes": {"versionNumber": "3.0.1", "protocols": "5.0"}`)
+3. Create implementation: `POST /api/v1/organization/{orgId}/provider/{providerId}/version/{versionId}/implementation` (`"type": "implementation"`, `"attributes": {"os": "linux", "arch": "amd64", "filename": "...", "downloadUrl": "...", "shasumsUrl": "...", "shasumsSignatureUrl": "...", "shasum": "<64-hex>", "keyId": "...", "asciiArmor": "...", "trustSignature": "", "source": "terraform", "sourceUrl": "..."}`)
+4. **Teardown (`finally`):** Delete in reverse order: `implementation` -> `version` -> `provider`.
+
+### 6.2 Registry Module & Provider Endpoints
+- **Modules:**
+  - `GET /terraform/modules/v1/{org}/{name}/{provider}/versions`
+  - `GET /terraform/modules/v1/{org}/{name}/{provider}/{version}/download`
+  - `GET /terraform/readme/v1/{org}/{name}/{provider}/{version}/download`
+- **Providers:**
+  - `GET /terraform/providers/v1/{org}/{provider}/versions`
+  - `GET /terraform/providers/v1/{org}/{provider}/{version}/download/{os}/{arch}`
+
+### 6.3 Authentication Modes for Registry E2E Verification
+1. **Dex User / PAT / Team Token (`NOT_INTERNAL` / `OIDC_USER` / `PAT_OR_TEAM_TOKEN`):**
+   - Authorized organization returns `200 OK`; unauthorized organization or RSQL/GraphQL injection payloads in the organization path (`aws%2Cname==azure`, `simple*`, `simple%22`) return `403 Forbidden`.
+2. **Federated OIDC (`FEDERATED`) via Ephemeral In-Cluster Mock OIDC:**
+   - Stand up an nginx `ConfigMap` + `Pod` + `Service` serving `/.well-known/openid-configuration` and `/jwks.json` using an **ephemeral per-run resource name** (`mock-oidc-<run_id>`). Never reuse the same K8s `Service` name across runs to avoid stale `kube-proxy`/CoreDNS timeouts.
+   - Wait for `Pod` readiness and non-empty `Endpoints`, create `Federated` (`issuer = "http://mock-oidc-<run_id>.terrakube.svc.cluster.local:8080"`, `audience`, `name`) + `FederatedClaim`, and create a `Team` in the target org whose `name == Federated.name`.
+   - Sign test JWTs carrying matching `aud`/claims **plus decoy `email`/`groups`** (`TERRAKUBE_ADMIN`) to prove Registry ignores unverified claims and authorizes strictly by `Federated.name` (`200` on authorized org, `403` on other orgs, `401` on mismatched claim).
+3. **Internal Service & Live `WORKSPACE_EXECUTOR` Runner Tokens:**
+   - Extract the signing key from Kubernetes:
+     ```bash
+     kubectl -n terrakube get secret terrakube-registry-secrets -o jsonpath={.data.InternalSecret}
+     ```
+     Base64-decode the K8s Secret value, then URL-safe base64-decode (padding `=` to multiple of 4) to raw key bytes (`HS512` when `>= 64` bytes, `HS384` `>= 48`, else `HS256`), and set `"iss": "TerrakubeInternal"`.
+   - Assert internal service taxonomy: `sub = "TerrakubeInternal (TOKEN)"` (`UNKNOWN_INTERNAL`) -> `403`; `sub = "TerrakubeInternal (EXECUTOR)"` without job context (`EXECUTOR_SERVICE`) -> `403`; `sub = "TerrakubeInternal (REGISTRY)"` (`REGISTRY_SERVICE`) -> `200` on Registry and permitted only on non-sensitive `Job`/`Step` status fields via `terrakube-api` (`Job.output`, `Job.terraformPlan`, `Step.output` remain hidden/rejected).
+   - **Minting/Testing Active `WORKSPACE_EXECUTOR` Tokens:** Launch an interactive `terraform apply -no-color` against a remote workspace using `pty.openpty()` so Terraform holds at the `Enter a value:` approval prompt while `Job` and its `Step` remain in `running` status. Poll `GET /api/v1/organization/{orgId}/workspace/{wsId}?include=job,job.step` for `jobId`/`stepId`, then verify:
+     - Active token (`organizationId`, `workspaceId`, `jobId`, `stepId`, `jti = "<jobId>-<stepId>"`) -> `200` on own org modules/providers, `403` on cross-org modules/providers, `403` when `workspaceId` does not match `Job.workspace`.
+     - Missing `stepId` with exact `jti = "<jobId>-<stepId>"` -> `200`; wrong `jobId` prefix in `jti` -> `403`.
+     - After cancelling the job (`PATCH /api/v1/organization/{orgId}/job/{jobId}` with `{"data": {"type": "job", "id": jobId, "attributes": {"status": "cancelled"}}}`), the same token returns `403` immediately on both modules and providers.
+
+### 6.4 Local vs Remote CLI Workspace Tests & `.terraformignore`
+1. Create temporary workspaces via `POST /api/v1/organization/{orgId}/workspace` (`executionMode: "local"` or `"remote"`, `terraformVersion: "1.9.8"`) and attach `Access` (`POST .../workspace/{wsId}/access`) if required by team permissions.
+2. **Always exclude `.terraform/` on Remote CLI runs:** `terraform init` populates `.terraform/modules/` locally. Unless `.terraform/` is listed in `.terraformignore`, `terraform plan` bundles cached modules inside the uploaded configuration `.tar.gz`, bypassing `terrakube-executor` downloads from `terrakube-reg.minikube.net`! Create `.terraformignore` containing `.terraform/` in remote test directories so same-org remote plans prove live runner-token registry auth (`Plan: ...`) and cross-org remote plans fail cleanly with `403 Forbidden`.
+3. **Workspace Teardown Fallback:** Delete any created `access` rows first, then `DELETE /api/v1/organization/{orgId}/workspace/{wsId}`. Workspaces that executed jobs return `400` or `409` on hard `DELETE` because of historical run records; fall back to soft-delete via `PATCH` with `{"data": {"type": "workspace", "id": wsId, "attributes": {"deleted": True}}}`.
+
+---
+
+## 7. Troubleshooting Runbook
 
 | Symptom | Probable Cause | Diagnostic / Resolution Steps |
 | :--- | :--- | :--- |
@@ -251,7 +323,7 @@ kubectl -n terrakube logs deployment/terrakube-api | grep -i "ChangeSet db/chang
 
 ---
 
-## 7. Useful Diagnostic Commands
+## 8. Useful Diagnostic Commands
 
 ```bash
 # Query recent jobs in PostgreSQL
